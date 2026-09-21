@@ -1,0 +1,358 @@
+local CONFIG = {
+    NoRecoil = false,
+    NoSpread = false,
+    MaxPen = false,
+    NoFlatline = false,
+    FlatlineVelocity = 200,
+}
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local function clamp(n, lo, hi)
+    if n < lo then return lo end
+    if n > hi then return hi end
+    return n
+end
+
+local function median(values)
+    if type(values) ~= "table" or #values == 0 then
+        return nil
+    end
+
+    local copy = {}
+    for _, value in ipairs(values) do
+        if type(value) == "number" then
+            copy[#copy + 1] = value
+        end
+    end
+
+    if #copy == 0 then
+        return nil
+    end
+
+    table.sort(copy)
+    return copy[math.floor((#copy + 1) / 2)]
+end
+
+local function safeCall(fn, ...)
+    if type(fn) ~= "function" then
+        return false, nil
+    end
+
+    return pcall(fn, ...)
+end
+
+local function getDamageTable()
+    if type(findgc) ~= "function" then
+        return nil
+    end
+
+    local ok, res = safeCall(findgc, "Damage", {
+        Spread = "number",
+        ShotAmount = "number",
+        MuzzleVelocity = "number",
+        Penetration = "number",
+    })
+
+    if not ok or type(res) ~= "table" or #res == 0 then
+        return nil
+    end
+
+    return res
+end
+
+local function normalizeKeyName(key)
+    if type(key) ~= "string" then
+        return ""
+    end
+    return string.lower(key)
+end
+
+local function getValueByKey(res, keys)
+    if type(res) ~= "table" then
+        return nil, nil, nil
+    end
+
+    local list = keys
+    if type(keys) ~= "table" then
+        list = { keys }
+    end
+
+    for _, key in ipairs(list) do
+        local target = normalizeKeyName(key)
+        for _, entry in ipairs(res) do
+            if normalizeKeyName(entry.key or "") == target and type(entry.value) == "number" and entry.addr then
+                return entry.value, entry.addr, entry.key
+            end
+        end
+    end
+
+    return nil, nil, nil
+end
+
+local function patchSingleKey(keys, targetValue)
+    local res = getDamageTable()
+    if type(res) ~= "table" or #res == 0 then
+        return nil
+    end
+
+    local originalValue, addr, realKey = getValueByKey(res, keys)
+    if originalValue == nil or not addr or not realKey then
+        return nil
+    end
+
+    safeCall(applygc, res, realKey, targetValue)
+    return { cache = res, key = realKey, original = originalValue, addr = addr }
+end
+
+local function restoreSingleKey(save)
+    if type(save) ~= "table" or not save.key then
+        return
+    end
+
+    if type(save.cache) == "table" then
+        safeCall(applygc, save.cache, save.key, save.original)
+    end
+end
+
+local spreadSave = nil
+local penSave = nil
+local flatSave = nil
+local scheduledRefresh = false
+local lastApplied = {
+    NoRecoil = nil,
+    NoSpread = nil,
+    MaxPen = nil,
+    NoFlatline = nil,
+    FlatlineVelocity = nil,
+}
+
+local function applyNoRecoil()
+    local enabled = CONFIG.NoRecoil == true
+    local ps = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
+    local bc = ps and ps:FindFirstChild("BallisticsClient")
+    local candidates = {}
+
+    if bc then
+        for _, child in ipairs(bc:GetChildren()) do
+            if child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("BoolValue") then
+                local name = string.lower(child.Name)
+                if name:find("recoil") or name:find("kick") or name:find("shake") or name:find("camera") then
+                    candidates[#candidates + 1] = child
+                end
+            end
+        end
+    end
+
+    if #candidates == 0 then
+        local flag = bc and bc:FindFirstChild("DebugShotsGui")
+        if flag then
+            flag.Value = not enabled
+        end
+        return
+    end
+
+    for _, obj in ipairs(candidates) do
+        if typeof(obj.Value) == "number" then
+            obj.Value = enabled and 0 or math.abs(obj.Value)
+        elseif typeof(obj.Value) == "boolean" then
+            obj.Value = not enabled
+        end
+    end
+end
+
+local function applyNoSpread()
+    local enabled = CONFIG.NoSpread == true
+    if enabled then
+        if not spreadSave then
+            spreadSave = patchSingleKey({ "Spread", "SpreadMultiplier", "BulletSpread" }, 0)
+        end
+    elseif spreadSave then
+        restoreSingleKey(spreadSave)
+        spreadSave = nil
+    end
+end
+
+local function applyMaxPen()
+    local enabled = CONFIG.MaxPen == true
+    if enabled then
+        if not penSave then
+            penSave = patchSingleKey({ "Penetration", "PenetrationMultiplier", "MaxPenetration" }, 106)
+        end
+    elseif penSave then
+        restoreSingleKey(penSave)
+        penSave = nil
+    end
+end
+
+local function applyNoFlatline()
+    local enabled = CONFIG.NoFlatline == true
+    local targetVelocity = clamp(tonumber(CONFIG.FlatlineVelocity) or 200, 0, 1000)
+
+    if enabled and targetVelocity > 0 then
+        if not flatSave then
+            local res = getDamageTable()
+            if type(res) == "table" then
+                local originalValue, _, realKey = getValueByKey(res, { "MuzzleVelocity", "Velocity", "ProjectileSpeed" })
+                if originalValue ~= nil and realKey then
+                    flatSave = { cache = res, key = realKey, original = originalValue }
+                end
+            end
+        end
+
+        if flatSave then
+            safeCall(applygc, flatSave.cache, flatSave.key, targetVelocity)
+            return
+        end
+    end
+
+    if flatSave then
+        restoreSingleKey(flatSave)
+        flatSave = nil
+    end
+end
+
+local function queueConfigRefresh()
+    if scheduledRefresh then
+        return
+    end
+
+    scheduledRefresh = true
+    task.delay(0.12, function()
+        scheduledRefresh = false
+        task.spawn(updateConfig)
+    end)
+end
+
+local function updateConfig()
+    if lastApplied.NoRecoil ~= CONFIG.NoRecoil then
+        lastApplied.NoRecoil = CONFIG.NoRecoil
+        applyNoRecoil()
+    end
+
+    if lastApplied.NoSpread ~= CONFIG.NoSpread then
+        lastApplied.NoSpread = CONFIG.NoSpread
+        applyNoSpread()
+    end
+
+    if lastApplied.MaxPen ~= CONFIG.MaxPen then
+        lastApplied.MaxPen = CONFIG.MaxPen
+        applyMaxPen()
+    end
+
+    if lastApplied.NoFlatline ~= CONFIG.NoFlatline or lastApplied.FlatlineVelocity ~= CONFIG.FlatlineVelocity then
+        lastApplied.NoFlatline = CONFIG.NoFlatline
+        lastApplied.FlatlineVelocity = CONFIG.FlatlineVelocity
+        applyNoFlatline()
+    end
+end
+
+local function ensureRem()
+    local env = (getgenv and getgenv()) or _G
+
+    if env.Rem and env.Rem.Alive then
+        return env.Rem
+    end
+
+    if env["Nine" .. "MfgUI"] and env["Nine" .. "MfgUI"].Alive then
+        return env["Nine" .. "MfgUI"]
+    end
+
+    local ok, rem = pcall(function()
+        return loadstring(game:HttpGet("https://raw.githubusercontent.com/9mfg/rem-ui/main/rem.lua"))()
+    end)
+
+    if ok and rem and rem.Alive then
+        return rem
+    end
+
+    for _ = 1, 50 do
+        task.wait(0.1)
+        if env.Rem and env.Rem.Alive then
+            return env.Rem
+        end
+
+        if env["Nine" .. "MfgUI"] and env["Nine" .. "MfgUI"].Alive then
+            return env["Nine" .. "MfgUI"]
+        end
+    end
+
+    return nil
+end
+
+local UI = nil
+for _ = 1, 50 do
+    UI = ensureRem()
+    if UI then
+        break
+    end
+    task.wait(0.1)
+end
+
+if not UI then
+    warn("REM UI did not initialize. Make sure the library loads before this script or paste both into one script.")
+    return
+end
+
+UI:SetTheme("Purple")
+local Main = UI:AddTab({ Title = "Weapon Mods", Icon = "script" })
+
+Main:AddToggle({
+    Title = "No Recoil",
+    Default = false,
+    Callback = function(value)
+        CONFIG.NoRecoil = value == true
+        queueConfigRefresh()
+    end,
+})
+
+Main:AddToggle({
+    Title = "No Spread",
+    Default = false,
+    Callback = function(value)
+        CONFIG.NoSpread = value == true
+        queueConfigRefresh()
+    end,
+})
+
+Main:AddToggle({
+    Title = "Max Pen",
+    Default = false,
+    Callback = function(value)
+        CONFIG.MaxPen = value == true
+        queueConfigRefresh()
+    end,
+})
+
+Main:AddToggle({
+    Title = "No Flatline",
+    Default = false,
+    Callback = function(value)
+        CONFIG.NoFlatline = value == true
+        queueConfigRefresh()
+    end,
+})
+
+Main:AddSlider({
+    Title = "Flatline Vel",
+    Min = 0,
+    Max = 1000,
+    Default = 200,
+    Step = 5,
+    Callback = function(value)
+        CONFIG.FlatlineVelocity = tonumber(value) or 200
+        if CONFIG.NoFlatline then
+            queueConfigRefresh()
+        end
+    end,
+})
+
+updateConfig()
+
+UI:Notify({
+    Title = "Weapon Mods",
+    Content = "Loaded and ready",
+    Type = "info",
+    Duration = 3,
+})
