@@ -1,358 +1,807 @@
-local CONFIG = {
-    NoRecoil = false,
-    NoSpread = false,
-    MaxPen = false,
-    NoFlatline = false,
-    FlatlineVelocity = 200,
+--============================================================================
+--  WEAPON MODS   -   Cold War [100 PLAYERS]
+--  build 2026-09-24j
+--============================================================================
+
+local BANNER = "Weapon Mods build 2026-09-24j"
+print(BANNER .. " - loading")
+
+-- stop a previous copy of this script (its watcher and its queue)
+pcall(function()
+	local old = _G and _G.WM
+	if old and type(old.stop) == "function" then old.stop() end
+end)
+
+--=============================== CONFIG =====================================
+local SPREAD_TARGET       = 0      -- No Spread   -> Spread = 0
+local PEN_TARGET          = 10     -- Max Pen     -> Penetration = 10 (game max)
+local GRAVITY_TARGET      = 0      -- No Flatline -> Gravity = 0 (exact 0 drop)
+local GRAVITY_RESTORE     = 75     -- stock value
+local SETTLE_AFTER_CHANGE = 15     -- quiet seconds after a spawn / class change
+local MIN_AUTO_INTERVAL   = 90     -- seconds between automatic re-applies
+local CACHE_TTL           = 900    -- reuse a cache younger than this
+local SCAN_WARN           = "30-45" -- wait hint shown while the GC is scanned
+local PASS_WARN           = "30"    -- wait hint shown for a one-off setgc pass
+local HOLD_LOG_INTERVAL   = 10     -- repeat the "why am I waiting" line this often
+
+-- keys we actually change
+local CAPTURE_KEYS = { "Spread", "Penetration", "Gravity" }
+-- extra keys only used to recognise a real weapon table in the scan
+local MARKER_KEYS  = { "Spread", "Penetration", "Gravity", "Damage", "MuzzleVelocity",
+                       "Ammo", "ReloadTime", "ShotAmount", "Recoil" }
+local MIN_MARKERS  = 2
+-- sanity ranges so we never write into something that is not a weapon stat
+local KEY_RANGE = {
+	Spread      = { min = 0.0001, max = 500 },
+	Penetration = { min = 0.0001, max = 100 },
+	Gravity     = { min = 0.0001, max = 500 },
+}
+-- names that pause heavy GC work (the game rebuilds weapon tables on these)
+local MENU_BLOCK_PATTERNS = { "class selection", "equipment selection", "still loading" }
+
+--============================= SHARED STATE =================================
+local WM = {
+	stopped    = false,
+	busy       = false,
+	queue      = {},
+	cache      = nil,
+	scanKeys   = nil,
+	weaponSet  = nil,
+	filterMode = "tables",   -- "tables" = weapon tables only, "range" = fallback
+	lastScan   = 0,
+	lastChange = os.clock(),
+	lastAuto   = 0,
+	needAuto   = false,
+	holdLogged = 0,
+	warnCount  = 0,     -- bumped by warn(); a job that warned gets a visible "done"
+	forceUntil = 0,
+	debug      = false,
+	lastOp     = "(idle)",
+	lastChar   = nil,
+	placeId    = game.PlaceId,
+	state      = { recoil = false, spread = false, pen = false, flat = false },
 }
 
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-
-local function clamp(n, lo, hi)
-    if n < lo then return lo end
-    if n > hi then return hi end
-    return n
-end
-
-local function median(values)
-    if type(values) ~= "table" or #values == 0 then
-        return nil
-    end
-
-    local copy = {}
-    for _, value in ipairs(values) do
-        if type(value) == "number" then
-            copy[#copy + 1] = value
-        end
-    end
-
-    if #copy == 0 then
-        return nil
-    end
-
-    table.sort(copy)
-    return copy[math.floor((#copy + 1) / 2)]
-end
-
-local function safeCall(fn, ...)
-    if type(fn) ~= "function" then
-        return false, nil
-    end
-
-    return pcall(fn, ...)
-end
-
-local function getDamageTable()
-    if type(findgc) ~= "function" then
-        return nil
-    end
-
-    local ok, res = safeCall(findgc, "Damage", {
-        Spread = "number",
-        ShotAmount = "number",
-        MuzzleVelocity = "number",
-        Penetration = "number",
-    })
-
-    if not ok or type(res) ~= "table" or #res == 0 then
-        return nil
-    end
-
-    return res
-end
-
-local function normalizeKeyName(key)
-    if type(key) ~= "string" then
-        return ""
-    end
-    return string.lower(key)
-end
-
-local function getValueByKey(res, keys)
-    if type(res) ~= "table" then
-        return nil, nil, nil
-    end
-
-    local list = keys
-    if type(keys) ~= "table" then
-        list = { keys }
-    end
-
-    for _, key in ipairs(list) do
-        local target = normalizeKeyName(key)
-        for _, entry in ipairs(res) do
-            if normalizeKeyName(entry.key or "") == target and type(entry.value) == "number" and entry.addr then
-                return entry.value, entry.addr, entry.key
-            end
-        end
-    end
-
-    return nil, nil, nil
-end
-
-local function patchSingleKey(keys, targetValue)
-    local res = getDamageTable()
-    if type(res) ~= "table" or #res == 0 then
-        return nil
-    end
-
-    local originalValue, addr, realKey = getValueByKey(res, keys)
-    if originalValue == nil or not addr or not realKey then
-        return nil
-    end
-
-    safeCall(applygc, res, realKey, targetValue)
-    return { cache = res, key = realKey, original = originalValue, addr = addr }
-end
-
-local function restoreSingleKey(save)
-    if type(save) ~= "table" or not save.key then
-        return
-    end
-
-    if type(save.cache) == "table" then
-        safeCall(applygc, save.cache, save.key, save.original)
-    end
-end
-
-local spreadSave = nil
-local penSave = nil
-local flatSave = nil
-local scheduledRefresh = false
-local lastApplied = {
-    NoRecoil = nil,
-    NoSpread = nil,
-    MaxPen = nil,
-    NoFlatline = nil,
-    FlatlineVelocity = nil,
-}
-
-local function applyNoRecoil()
-    local enabled = CONFIG.NoRecoil == true
-    local ps = LocalPlayer and LocalPlayer:FindFirstChild("PlayerScripts")
-    local bc = ps and ps:FindFirstChild("BallisticsClient")
-    local candidates = {}
-
-    if bc then
-        for _, child in ipairs(bc:GetChildren()) do
-            if child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("BoolValue") then
-                local name = string.lower(child.Name)
-                if name:find("recoil") or name:find("kick") or name:find("shake") or name:find("camera") then
-                    candidates[#candidates + 1] = child
-                end
-            end
-        end
-    end
-
-    if #candidates == 0 then
-        local flag = bc and bc:FindFirstChild("DebugShotsGui")
-        if flag then
-            flag.Value = not enabled
-        end
-        return
-    end
-
-    for _, obj in ipairs(candidates) do
-        if typeof(obj.Value) == "number" then
-            obj.Value = enabled and 0 or math.abs(obj.Value)
-        elseif typeof(obj.Value) == "boolean" then
-            obj.Value = not enabled
-        end
-    end
-end
-
-local function applyNoSpread()
-    local enabled = CONFIG.NoSpread == true
-    if enabled then
-        if not spreadSave then
-            spreadSave = patchSingleKey({ "Spread", "SpreadMultiplier", "BulletSpread" }, 0)
-        end
-    elseif spreadSave then
-        restoreSingleKey(spreadSave)
-        spreadSave = nil
-    end
-end
-
-local function applyMaxPen()
-    local enabled = CONFIG.MaxPen == true
-    if enabled then
-        if not penSave then
-            penSave = patchSingleKey({ "Penetration", "PenetrationMultiplier", "MaxPenetration" }, 106)
-        end
-    elseif penSave then
-        restoreSingleKey(penSave)
-        penSave = nil
-    end
-end
-
-local function applyNoFlatline()
-    local enabled = CONFIG.NoFlatline == true
-    local targetVelocity = clamp(tonumber(CONFIG.FlatlineVelocity) or 200, 0, 1000)
-
-    if enabled and targetVelocity > 0 then
-        if not flatSave then
-            local res = getDamageTable()
-            if type(res) == "table" then
-                local originalValue, _, realKey = getValueByKey(res, { "MuzzleVelocity", "Velocity", "ProjectileSpeed" })
-                if originalValue ~= nil and realKey then
-                    flatSave = { cache = res, key = realKey, original = originalValue }
-                end
-            end
-        end
-
-        if flatSave then
-            safeCall(applygc, flatSave.cache, flatSave.key, targetVelocity)
-            return
-        end
-    end
-
-    if flatSave then
-        restoreSingleKey(flatSave)
-        flatSave = nil
-    end
-end
-
-local function queueConfigRefresh()
-    if scheduledRefresh then
-        return
-    end
-
-    scheduledRefresh = true
-    task.delay(0.12, function()
-        scheduledRefresh = false
-        task.spawn(updateConfig)
-    end)
-end
-
-local function updateConfig()
-    if lastApplied.NoRecoil ~= CONFIG.NoRecoil then
-        lastApplied.NoRecoil = CONFIG.NoRecoil
-        applyNoRecoil()
-    end
-
-    if lastApplied.NoSpread ~= CONFIG.NoSpread then
-        lastApplied.NoSpread = CONFIG.NoSpread
-        applyNoSpread()
-    end
-
-    if lastApplied.MaxPen ~= CONFIG.MaxPen then
-        lastApplied.MaxPen = CONFIG.MaxPen
-        applyMaxPen()
-    end
-
-    if lastApplied.NoFlatline ~= CONFIG.NoFlatline or lastApplied.FlatlineVelocity ~= CONFIG.FlatlineVelocity then
-        lastApplied.NoFlatline = CONFIG.NoFlatline
-        lastApplied.FlatlineVelocity = CONFIG.FlatlineVelocity
-        applyNoFlatline()
-    end
-end
-
-local function ensureRem()
-    local env = (getgenv and getgenv()) or _G
-
-    if env.Rem and env.Rem.Alive then
-        return env.Rem
-    end
-
-    if env["Nine" .. "MfgUI"] and env["Nine" .. "MfgUI"].Alive then
-        return env["Nine" .. "MfgUI"]
-    end
-
-    local ok, rem = pcall(function()
-        return loadstring(game:HttpGet("https://raw.githubusercontent.com/9mfg/rem-ui/main/rem.lua"))()
-    end)
-
-    if ok and rem and rem.Alive then
-        return rem
-    end
-
-    for _ = 1, 50 do
-        task.wait(0.1)
-        if env.Rem and env.Rem.Alive then
-            return env.Rem
-        end
-
-        if env["Nine" .. "MfgUI"] and env["Nine" .. "MfgUI"].Alive then
-            return env["Nine" .. "MfgUI"]
-        end
-    end
-
-    return nil
-end
+local function clock() return os.clock() end
+local function log(msg) print(string.format("[WM %7.2fs] %s", clock(), msg)) end
+local function dbg(msg) if WM.debug then print(string.format("[WM %7.2fs] dbg  %s", clock(), msg)) end end
 
 local UI = nil
-for _ = 1, 50 do
-    UI = ensureRem()
-    if UI then
-        break
-    end
-    task.wait(0.1)
+local syncToggles = function() end   -- filled in once the UI exists
+local function notify(title, content, ntype, dur)
+	if UI and UI.Alive then
+		pcall(function()
+			UI:Notify({ Title = title, Content = content, Type = ntype or "info", Duration = dur or 5 })
+		end)
+	end
+end
+-- visible to the user: long operations that must not be interrupted
+local function warn(msg)
+	WM.warnCount = WM.warnCount + 1
+	log(msg)
+	notify("Weapon Mods", msg, "info", 7)
+end
+-- errors are always visible
+local function fail(msg)
+	log(msg)
+	notify("Error", msg, "error", 8)
+end
+-- internal chatter: console line AND popup only when Debug Keys is on
+local function note(msg)
+	if WM.debug then
+		log(msg)
+		notify("Weapon Mods", msg, "info", 4)
+	end
 end
 
-if not UI then
-    warn("REM UI did not initialize. Make sure the library loads before this script or paste both into one script.")
-    return
+--============================= GAME HELPERS =================================
+local Players = game:GetService("Players")
+
+local function lp()
+	local ok, p = pcall(function() return Players.LocalPlayer end)
+	if ok then return p end
+	return nil
 end
 
-UI:SetTheme("Purple")
-local Main = UI:AddTab({ Title = "Weapon Mods", Icon = "script" })
+local function childrenOf(parent)
+	if not parent then return nil end
+	local ok, kids = pcall(function() return parent:GetChildren() end)
+	if ok and type(kids) == "table" then return kids end
+	return nil
+end
 
-Main:AddToggle({
-    Title = "No Recoil",
-    Default = false,
-    Callback = function(value)
-        CONFIG.NoRecoil = value == true
-        queueConfigRefresh()
-    end,
+local function toolIn(container)
+	local kids = childrenOf(container)
+	if not kids then return nil end
+	for _, c in ipairs(kids) do
+		if c.ClassName == "Tool" then return c end
+	end
+	return nil
+end
+
+local function currentTool()
+	local p = lp()
+	if not p then return nil end
+	local t = toolIn(p.Character)
+	if t then return t end
+	return toolIn(p:FindFirstChild("Backpack"))
+end
+
+local function menuGuiName()
+	local p = lp()
+	if not p then return nil end
+	local pg = p:FindFirstChild("PlayerGui")
+	local kids = childrenOf(pg)
+	if not kids then return nil end
+	for _, g in ipairs(kids) do
+		local n = g.Name
+		if type(n) == "string" then
+			local low = string.lower(n)
+			for _, pat in ipairs(MENU_BLOCK_PATTERNS) do
+				if string.find(low, pat, 1, true) then return n end
+			end
+		end
+	end
+	return nil
+end
+
+local function ballisticsClient()
+	local p = lp()
+	if not p then return nil end
+	local ps = p:FindFirstChild("PlayerScripts")
+	if not ps then return nil end
+	return ps:FindFirstChild("BallisticsClient")
+end
+
+local function setRecoil(on)
+	local bc = ballisticsClient()
+	if not bc then return false, "BallisticsClient not found (are you in a match?)" end
+	local v = bc:FindFirstChild("DebugShotsGui")
+	if not v then return false, "DebugShotsGui not found" end
+	local ok = pcall(function() v.Value = on and true or false end)
+	if not ok then return false, "could not write DebugShotsGui" end
+	return true, "DebugShotsGui = " .. tostring(on)
+end
+
+--============================= TIME / GUARDS ================================
+local function alive()
+	if WM.stopped then return false end
+	if game.PlaceId ~= WM.placeId then return false end
+	if lp() == nil then return false end
+	return true
+end
+
+local function settleLeft()
+	local left = SETTLE_AFTER_CHANGE - (clock() - WM.lastChange)
+	if left < 0 then left = 0 end
+	return left
+end
+
+-- nil = safe to touch the GC, otherwise the reason we are waiting
+local function guardReason()
+	if WM.stopped then return "script stopped" end
+	if lp() == nil then return "no LocalPlayer (joining / leaving)" end
+	if clock() < WM.forceUntil then return nil end
+	local p = lp()
+	local ch = p.Character
+	if not ch then return "no character yet" end
+	local hum = ch:FindFirstChild("Humanoid")
+	if not hum then return "no Humanoid yet" end
+	local ok, hp = pcall(function() return hum.Health end)
+	if not ok or type(hp) ~= "number" or hp <= 0 then return "not alive yet" end
+	if not currentTool() then return "waiting for a weapon (deploy / equip first)" end
+	local m = menuGuiName()
+	if m then return "menu open: " .. m end
+	local left = settleLeft()
+	if left > 0 then return string.format("settling after spawn / class change (%.0fs left)", left) end
+	return nil
+end
+
+--============================= GC PRIMITIVES ================================
+local function isNumericEntry(e)
+	if type(e) ~= "table" then return false end
+	if e.type == "number" or e.vtt == 3 then
+		return tonumber(e.value) ~= nil
+	end
+	return false
+end
+
+local function numericValueOf(e)
+	if type(e) ~= "table" then return nil end
+	return tonumber(e.value)
+end
+
+local function isFiniteNumber(v)
+	return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local function tableKeyOf(e)
+	local k = e.tbl or e.table or e.parent or e.tbladdr
+	if k == nil then return nil end
+	return tostring(k)
+end
+
+local function isEligible(e)
+	if type(e) ~= "table" then return false end
+	local rng = KEY_RANGE[e.key]
+	if not rng then return false end
+	if not isNumericEntry(e) then return false end
+	local v = numericValueOf(e)
+	if not isFiniteNumber(v) then return false end
+	if v < rng.min or v > rng.max then return false end
+	if WM.filterMode == "tables" then
+		local t = tableKeyOf(e)
+		if not t then return false end
+		if not (WM.weaponSet and WM.weaponSet[t]) then return false end
+	end
+	return true
+end
+
+local function countEligible(entries, key)
+	if not entries then return 0 end
+	local n = 0
+	for _, e in ipairs(entries) do
+		if type(e) == "table" and e.key == key and isEligible(e) then n = n + 1 end
+	end
+	return n
+end
+
+local function rebuildWeaponSet(entries)
+	local groups, anyTableInfo = {}, false
+	for _, e in ipairs(entries) do
+		if type(e) == "table" then
+			local t = tableKeyOf(e)
+			if t then
+				anyTableInfo = true
+				local g = groups[t]
+				if not g then g = { m = 0, keys = {} }; groups[t] = g end
+				if not g.keys[e.key] then
+					g.keys[e.key] = true
+					for _, m in ipairs(MARKER_KEYS) do
+						if e.key == m then g.m = g.m + 1 end
+					end
+				end
+			end
+		end
+	end
+	local set, matched = {}, 0
+	for t, g in pairs(groups) do
+		if g.m >= MIN_MARKERS then set[t] = true; matched = matched + 1 end
+	end
+	return set, matched, anyTableInfo
+end
+
+local function applyCached(key, target)
+	if not WM.cache then return false, 0, "no cache" end
+	local t0 = clock()
+	local ok, res = pcall(applygc, WM.cache, key, target)
+	if not ok then return false, 0, tostring(res) end
+	local n = tonumber(res) or 0
+	dbg(string.format("%s: %d field(s) in %.2fs", key, n, clock() - t0))
+	return true, n, nil
+end
+
+local function setgcOne(key, target)
+	local t0 = clock()
+	local ok, res = pcall(setgc, key, target)
+	if not ok then return false, 0, tostring(res) end
+	local n = tonumber(res) or 0
+	log(string.format("%s: %d field(s) set in %.1fs", key, n, clock() - t0))
+	return true, n, nil
+end
+
+--============================= HEAVY JOBS ===================================
+local function mergedScanKeys()
+	local keys = {}
+	for _, k in ipairs(CAPTURE_KEYS) do table.insert(keys, k) end
+	for _, k in ipairs({ "Damage", "MuzzleVelocity" }) do table.insert(keys, k) end
+	return keys
+end
+
+local function jobScan()
+	local t0 = clock()
+	warn("No Spread: scanning the GC now - do not touch anything for about " .. SCAN_WARN .. " seconds")
+	local keys = mergedScanKeys()
+	local ok, entries = pcall(getgc, keys)
+	if not ok then
+		WM.cache = nil
+		WM.weaponSet = nil
+		dbg("getgc failed: " .. tostring(entries))
+		fail("getgc did not accept the name list - using setgc instead")
+		return
+	end
+	if type(entries) ~= "table" then
+		WM.cache = nil
+		fail("getgc returned " .. type(entries) .. " instead of a table - scan cancelled")
+		return
+	end
+	if not alive() then dbg("scan aborted - player left the game"); return end
+	local total = 0
+	for _, e in ipairs(entries) do if type(e) == "table" then total = total + 1 end end
+
+	local set, matched, anyTableInfo = rebuildWeaponSet(entries)
+	local counts = {}
+	for _, k in ipairs(CAPTURE_KEYS) do counts[k] = 0 end
+
+	WM.cache      = entries
+	WM.weaponSet  = set
+	WM.scanKeys   = keys
+	WM.filterMode = "tables"
+	if (not anyTableInfo) or matched == 0 then
+		WM.filterMode = "range"
+		note("no weapon-table grouping available - falling back to value ranges")
+	end
+	for _, k in ipairs(CAPTURE_KEYS) do counts[k] = countEligible(entries, k) end
+	WM.lastScan = clock()
+
+	dbg(string.format("scan: %d entries in %.1fs, weapon tables matched: %d", total, clock() - t0, matched))
+	dbg(string.format("cache ready: Spread=%d Penetration=%d Gravity=%d",
+		counts.Spread, counts.Penetration, counts.Gravity))
+	dbg(string.format("GC scan done in %.1fs - %d entries, %d weapon table(s), mode=%s",
+		clock() - t0, total, matched, WM.filterMode))
+	note(string.format("scan complete - %d entries, %d weapon tables", total, matched))
+end
+
+local function ensureCache(force)
+	if WM.cache and not force and (clock() - WM.lastScan) < CACHE_TTL then
+		dbg("reusing cache from " .. string.format("%.0fs ago", clock() - WM.lastScan))
+		return
+	end
+	if WM.cache and (clock() - WM.lastScan) >= CACHE_TTL then
+		note("cache is old - scanning the GC again")
+	end
+	jobScan()
+end
+
+-- spread / max pen need the per-entry originals, so they use the cache
+local function jobApplyKey(key, target)
+	ensureCache(false)
+	if not alive() then dbg("apply aborted - player left the game"); return end
+	if not WM.cache then
+		-- no cache (scan refused or failed): one setgc pass still gets the job done
+		warn("no cache yet - one " .. key .. " pass, do not touch anything for about " .. PASS_WARN .. " seconds")
+		local sok, sn, serr = setgcOne(key, target)
+		if not sok then
+			fail("could not apply " .. key .. ": " .. tostring(serr))
+			return
+		end
+		note(string.format("%s now %s (%d field(s), one pass)", key, tostring(target), sn))
+		return
+	end
+	local ok, n, err = applyCached(key, target)
+	if not ok then
+		fail("could not apply " .. key .. ": " .. tostring(err))
+		return
+	end
+	note(string.format("%s now %s (%d field(s))", key, tostring(target), n))
+end
+
+-- flatline: never scans. Uses the cache when one already exists (instant),
+-- otherwise exactly one setgc pass. getgc is never called from here.
+local function jobFlatline()
+	if not alive() then dbg("flatline aborted - player left the game"); return end
+	local ok, n, err
+	if WM.cache then
+		ok, n, err = applyCached("Gravity", GRAVITY_TARGET)
+		if ok then
+			note(string.format("No Flatline on - Gravity is %d (%d field(s), exact zero drop)", GRAVITY_TARGET, n))
+			return
+		end
+		note("cached apply failed (" .. tostring(err) .. ") - using one setgc pass instead")
+		if not alive() then return end
+	end
+	warn("No Flatline: one Gravity pass now - do not touch anything for about " .. PASS_WARN .. " seconds")
+	ok, n, err = setgcOne("Gravity", GRAVITY_TARGET)
+	if not ok then
+		fail("could not set Gravity: " .. tostring(err))
+		return
+	end
+	if n == 0 then
+		warn("No Flatline: no Gravity fields found yet - deploy into a match, then toggle off and on again")
+	else
+		note(string.format("No Flatline on - Gravity is %d (%d field(s), exact zero drop)", GRAVITY_TARGET, n))
+	end
+end
+
+local function jobRestoreGravity()
+	if not alive() then dbg("restore aborted - player left the game"); return end
+	local ok, n, err
+	if WM.cache then
+		ok, n, err = applyCached("Gravity", GRAVITY_RESTORE)
+		if not ok then
+			note("cached restore failed (" .. tostring(err) .. ") - using one setgc pass instead")
+			if not alive() then return end
+		end
+	end
+	if not ok then
+		warn("Restore Gravity: one pass now - do not touch anything for about " .. PASS_WARN .. " seconds")
+		ok, n, err = setgcOne("Gravity", GRAVITY_RESTORE)
+	end
+	if not ok then
+		fail("could not restore Gravity: " .. tostring(err))
+		return
+	end
+	WM.state.flat = false
+	syncToggles()
+	note(string.format("Gravity restored to %d (%d field(s))", GRAVITY_RESTORE, n))
+end
+
+-- cache only, instant, never scans and never calls setgc
+local function jobReapply(useCacheOnly)
+	local did = {}
+	if not WM.cache then
+		note("re-apply skipped: no cache yet - toggle No Spread or press Scan GC once")
+		return
+	end
+	if WM.state.spread then
+		local ok, n = applyCached("Spread", SPREAD_TARGET)
+		if ok then table.insert(did, "Spread=" .. n) end
+	end
+	if WM.state.pen then
+		local ok, n = applyCached("Penetration", PEN_TARGET)
+		if ok then table.insert(did, "Penetration=" .. n) end
+	end
+	if WM.state.flat then
+		local g = countEligible(WM.cache, "Gravity")
+		if g > 0 then
+			local ok, n = applyCached("Gravity", GRAVITY_TARGET)
+			if ok then table.insert(did, "Gravity=" .. n) end
+		elseif not useCacheOnly then
+			dbg("cache holds no Gravity field - flatline stays on the last setgc pass")
+		end
+	end
+	WM.lastAuto = clock()
+	dbg("re-apply done (cache, instant): " .. (#did > 0 and table.concat(did, " ") or "nothing to do"))
+	if #did > 0 and not useCacheOnly then note("Re-applied from cache: " .. table.concat(did, " ")) end
+end
+
+--============================= OPERATION QUEUE ==============================
+local pump
+pump = function()
+	if WM.stopped or WM.busy then return end
+	local job = WM.queue[1]
+	if not job then return end
+	local reason = guardReason()
+	if reason then
+		if not job.heldOnce then
+			job.heldOnce = true
+			warn("waiting to run '" .. job.name .. "' - " .. reason)
+		elseif WM.debug and (clock() - WM.holdLogged) > HOLD_LOG_INTERVAL then
+			WM.holdLogged = clock()
+			dbg(string.format("still holding '%s' back - %s", job.name, reason))
+		end
+		task.delay(2, function() pump() end)
+		return
+	end
+	table.remove(WM.queue, 1)
+	WM.busy = true
+	WM.lastOp = job.name
+	task.spawn(function()
+		local t0 = clock()
+		local warned = WM.warnCount
+		dbg("OP START: " .. job.name)
+		local ok, err = pcall(job.fn)
+		WM.busy = false
+		if ok then
+			if WM.warnCount > warned then
+				log(string.format("done - %s (%.1fs)", job.name, clock() - t0))
+			end
+			dbg(string.format("OP DONE: %s (%.1fs)", job.name, clock() - t0))
+		else
+			fail(string.format("OP FAILED: %s -> %s", job.name, tostring(err)))
+		end
+		WM.lastOp = "(idle)"
+		task.delay(0.3, function() pump() end)
+	end)
+end
+
+local function enqueue(name, fn)
+	if WM.stopped then dbg("ignored '" .. name .. "' - script is stopped"); return end
+	table.insert(WM.queue, { name = name, fn = fn })
+	if #WM.queue > 1 or WM.busy then
+		dbg("queued: " .. name .. " (waiting for the operation in front of it)")
+	else
+		dbg("queued: " .. name)
+	end
+	pump()
+end
+
+--============================= TOGGLES ======================================
+local function toggle(key, on)
+	WM.state[key] = on
+	if key == "recoil" then
+		local ok, msg = setRecoil(on)
+		dbg("No Recoil " .. (on and "on" or "off") .. " -> " .. tostring(msg))
+		if not ok then notify("No Recoil", msg, "error", 6) end
+		return
+	end
+	if key == "spread" then
+		if on then
+			enqueue("No Spread ON (Spread -> " .. SPREAD_TARGET .. ")", function()
+				jobApplyKey("Spread", SPREAD_TARGET)
+			end)
+		else
+			note("No Spread off - the value stays patched. Rejoin to reset it.")
+		end
+		return
+	end
+	if key == "pen" then
+		if on then
+			enqueue("Max Pen ON (Penetration -> " .. PEN_TARGET .. ")", function()
+				jobApplyKey("Penetration", PEN_TARGET)
+			end)
+		else
+			note("Max Pen off - the value stays patched. Rejoin to reset it.")
+		end
+		return
+	end
+	if key == "flat" then
+		if on then
+			-- never scans: instant from a warm cache, otherwise one setgc pass
+			enqueue("No Flatline ON (Gravity -> " .. GRAVITY_TARGET .. ")", jobFlatline)
+		else
+			note("No Flatline off - gravity stays " .. GRAVITY_TARGET .. " until you press Restore Gravity.")
+		end
+		return
+	end
+end
+
+--============================= CONSOLE COMMANDS =============================
+local function cacheSummary()
+	if not WM.cache then return "none" end
+	return string.format("%d entries, %.0fs old, mode=%s, Spread=%d Pen=%d Grav=%d",
+		#WM.cache, clock() - WM.lastScan, WM.filterMode,
+		countEligible(WM.cache, "Spread"), countEligible(WM.cache, "Penetration"),
+		countEligible(WM.cache, "Gravity"))
+end
+
+local function cmdStatus()
+	local p = lp()
+	local tool = currentTool()
+	print("----------------------------------------------------------")
+	print(BANNER)
+	print(string.format("  stopped=%s busy=%s lastOp=%s queue=%d",
+		tostring(WM.stopped), tostring(WM.busy), WM.lastOp, #WM.queue))
+	print(string.format("  toggles: recoil=%s spread=%s pen=%s flat=%s",
+		tostring(WM.state.recoil), tostring(WM.state.spread),
+		tostring(WM.state.pen), tostring(WM.state.flat)))
+	print(string.format("  LocalPlayer=%s character=%s tool=%s",
+		p and p.Name or "nil", (p and p.Character) and p.Character.Name or "nil",
+		tool and tool.Name or "nil"))
+	print(string.format("  menu gui=%s settle left=%.0fs placeId=%d",
+		tostring(menuGuiName()), settleLeft(), WM.placeId))
+	print(string.format("  guard: %s", tostring(guardReason()) or "SAFE - GC may be touched"))
+	print(string.format("  cache: %s", cacheSummary()))
+	print("----------------------------------------------------------")
+end
+
+local function cmdTool()
+	local tool = currentTool()
+	if tool then
+		log("equipped tool: " .. tool.Name)
+	else
+		log("no Tool in Character or Backpack right now")
+	end
+end
+
+local function cmdForce()
+	WM.forceUntil = clock() + 120
+	warn("guard bypassed for 120s - the next queued operation may run outside a match")
+	pump()
+end
+
+local function cmdStop()
+	WM.stopped = true
+	WM.queue = {}
+	log("stopped - safe to rejoin now, no further GC calls from this script")
+end
+
+local function cmdRestoreGravity()
+	WM.state.flat = false
+	enqueue("Restore Gravity (" .. GRAVITY_RESTORE .. ")", jobRestoreGravity)
+end
+
+local function cmdReapply()
+	enqueue("Re-apply now (cache)", function() jobReapply(false) end)
+end
+
+local function cmdScan()
+	enqueue("Scan GC", jobScan)
+end
+
+WM.stop = cmdStop
+
+--============================= UI ===========================================
+local function getRem()
+	local ok, r = pcall(function() return Rem end)
+	if ok and r and r.Alive then return r end
+	return nil
+end
+
+local function loadRem()
+	-- rem.lua is the live library file; anything else 404s and the HTML body
+	-- would blow up loadstring, so validate the source before running it.
+	local urls = {
+		"https://raw.githubusercontent.com/9mfg/rem-ui/main/rem.lua",
+	}
+	for _, url in ipairs(urls) do
+		local ok, src = pcall(function() return game:HttpGet(url) end)
+		if ok and type(src) == "string" and #src > 200
+			and not string.find(src, "^404", 1)
+			and not string.find(src, "Not Found", 1, true) then
+			pcall(function() loadstring(src)() end)
+			local r = getRem()
+			if r then return r end
+		end
+	end
+	return nil
+end
+
+UI = getRem() or loadRem()
+if not (UI and UI.Alive) then
+	print("[WM] REM UI could not be loaded (rem.lua) - check your internet, then this script.")
+	return
+end
+
+local tab = UI:AddTab({ Title = "Weapon Mods", Icon = "script" })
+local ToggleObjs = {}
+
+tab:AddLabel({
+	Title = BANNER,
+	Description = "No Flatline is one Gravity pass on its own. Spread and Max Pen share a single GC scan.",
 })
 
-Main:AddToggle({
-    Title = "No Spread",
-    Default = false,
-    Callback = function(value)
-        CONFIG.NoSpread = value == true
-        queueConfigRefresh()
-    end,
+ToggleObjs.recoil = tab:AddToggle({
+	Title = "No Recoil",
+	Description = "Debug shot overlay - removes visible recoil.",
+	Default = WM.state.recoil,
+	Callback = function(v) toggle("recoil", v) end,
 })
 
-Main:AddToggle({
-    Title = "Max Pen",
-    Default = false,
-    Callback = function(value)
-        CONFIG.MaxPen = value == true
-        queueConfigRefresh()
-    end,
+ToggleObjs.spread = tab:AddToggle({
+	Title = "No Spread",
+	Description = "Spread = 0. First press scans the GC (about 20-45s).",
+	Default = WM.state.spread,
+	Callback = function(v) toggle("spread", v) end,
 })
 
-Main:AddToggle({
-    Title = "No Flatline",
-    Default = false,
-    Callback = function(value)
-        CONFIG.NoFlatline = value == true
-        queueConfigRefresh()
-    end,
+ToggleObjs.pen = tab:AddToggle({
+	Title = "Max Penetration",
+	Description = "Penetration = 10 (the game's own cap). Reuses the same cache.",
+	Default = WM.state.pen,
+	Callback = function(v) toggle("pen", v) end,
 })
 
-Main:AddSlider({
-    Title = "Flatline Vel",
-    Min = 0,
-    Max = 1000,
-    Default = 200,
-    Step = 5,
-    Callback = function(value)
-        CONFIG.FlatlineVelocity = tonumber(value) or 200
-        if CONFIG.NoFlatline then
-            queueConfigRefresh()
-        end
-    end,
+ToggleObjs.flat = tab:AddToggle({
+	Title = "No Flatline",
+	Description = "Gravity = 0, exact zero bullet drop. Instant from cache, otherwise one pass.",
+	Default = WM.state.flat,
+	Callback = function(v) toggle("flat", v) end,
 })
 
-updateConfig()
-
-UI:Notify({
-    Title = "Weapon Mods",
-    Content = "Loaded and ready",
-    Type = "info",
-    Duration = 3,
+tab:AddButton({
+	Title = "Restore Gravity",
+	Description = "Puts Gravity back to 75 (one pass).",
+	ButtonText = "Restore",
+	Callback = function() cmdRestoreGravity() end,
 })
+
+tab:AddButton({
+	Title = "Status",
+	Description = "Prints the full state to the console (F9).",
+	ButtonText = "Print",
+	Callback = function() cmdStatus() end,
+})
+
+tab:AddButton({
+	Title = "Re-apply now",
+	Description = "Instant, from the cache. No scan, no Gravity pass.",
+	ButtonText = "Re-apply",
+	Callback = function() cmdReapply() end,
+})
+
+tab:AddButton({
+	Title = "Scan GC",
+	Description = "Warms the cache on purpose (20-45s, do not toggle during it).",
+	ButtonText = "Scan",
+	Callback = function() cmdScan() end,
+})
+
+tab:AddToggle({
+	Title = "Debug Keys",
+	Description = "Show internal chatter in the console.",
+	Default = WM.debug,
+	Callback = function(v) WM.debug = v and true or false end,
+})
+
+tab:AddButton({
+	Title = "Run now (skip guard)",
+	Description = "Bypasses the match/settle guard for 120s if a job is being held back.",
+	ButtonText = "Force",
+	Callback = function() cmdForce() end,
+})
+
+tab:AddLabel({
+	Title = "Reset",
+	Description = "Spread and Max Pen are cleared by rejoining. Press Stop before you rejoin.",
+})
+
+tab:AddButton({
+	Title = "Stop script",
+	Description = "Kills the watcher and the queue. Do this before rejoining.",
+	ButtonText = "Stop",
+	Callback = function() cmdStop() end,
+})
+
+syncToggles = function()
+	pcall(function()
+		if ToggleObjs.flat then ToggleObjs.flat:SetValue(WM.state.flat and true or false, true) end
+		if ToggleObjs.spread then ToggleObjs.spread:SetValue(WM.state.spread and true or false, true) end
+		if ToggleObjs.pen then ToggleObjs.pen:SetValue(WM.state.pen and true or false, true) end
+	end)
+end
+
+pcall(function() tab:Select() end)
+
+--============================= PUBLIC COMMANDS ==============================
+_G.WM_Status         = cmdStatus
+_G.WM_Tool           = cmdTool
+_G.WM_Reapply        = cmdReapply
+_G.WM_RestoreGravity = cmdRestoreGravity
+_G.WM_Scan           = cmdScan
+_G.WM_Force          = cmdForce
+_G.WM_Stop           = cmdStop
+_G.WM                = WM
+WM_Status         = cmdStatus
+WM_Tool           = cmdTool
+WM_Reapply        = cmdReapply
+WM_RestoreGravity = cmdRestoreGravity
+WM_Scan           = cmdScan
+WM_Force          = cmdForce
+WM_Stop           = cmdStop
+
+--============================= WATCHER ======================================
+task.spawn(function()
+	local gone = 0
+	while not WM.stopped do
+		task.wait(1)
+		if WM.stopped then break end
+		if game.PlaceId ~= WM.placeId then
+			WM.stopped = true
+			WM.queue = {}
+			log("place changed (rejoining / new server) - watcher stopped, no further GC calls")
+			break
+		end
+		local p = lp()
+		if not p then
+			gone = gone + 1
+			if gone >= 3 then
+				WM.stopped = true
+				WM.queue = {}
+				log("LocalPlayer is gone - watcher stopped, no further GC calls")
+				break
+			end
+		else
+			gone = 0
+			local ch = p.Character
+			if ch ~= WM.lastChar then
+				WM.lastChar = ch
+				WM.lastChange = clock()
+				WM.needAuto = true
+				dbg(string.format("spawn / class change - holding GC operations for %ds", SETTLE_AFTER_CHANGE))
+			end
+			if WM.state.recoil then setRecoil(true) end
+			if WM.needAuto and alive() and guardReason() == nil
+				and (clock() - WM.lastAuto) >= MIN_AUTO_INTERVAL then
+				WM.needAuto = false
+				if WM.state.spread or WM.state.pen or WM.state.flat then
+					enqueue("auto re-apply (cache)", function() jobReapply(true) end)
+				end
+			end
+		end
+	end
+end)
+
+dbg("ready - No Flatline never scans, Spread and Max Pen share one scan")
+log("ready - right shift opens the menu. Press Stop before you rejoin.")
+notify("Weapon Mods", "Loaded. Press Stop before you rejoin.", "success", 6)
