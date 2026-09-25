@@ -646,11 +646,9 @@ end
 local tab = UI:AddTab({ Title = "Weapon Mods", Icon = "script" })
 local ToggleObjs = {}
 
-tab:AddLabel({
-	Title = BANNER,
-	Description = "No Flatline is one Gravity pass on its own. Spread and Max Pen share a single GC scan.",
-})
-
+-- REM shows 4 controls per page in the order you add them, so page 1 is the
+-- four gun modules and everything else lives on the later pages.
+-- Page 1: the four main gun modules.
 ToggleObjs.recoil = tab:AddToggle({
 	Title = "No Recoil",
 	Description = "Debug shot overlay - removes visible recoil.",
@@ -679,18 +677,19 @@ ToggleObjs.flat = tab:AddToggle({
 	Callback = function(v) toggle("flat", v) end,
 })
 
-tab:AddButton({
-	Title = "Restore Gravity",
-	Description = "Puts Gravity back to 75 (one pass).",
-	ButtonText = "Restore",
-	Callback = function() cmdRestoreGravity() end,
-})
-
+-- Page 2: gun tools (Status / Restore / Re-apply / Scan).
 tab:AddButton({
 	Title = "Status",
 	Description = "Prints the full state to the console (F9).",
 	ButtonText = "Print",
 	Callback = function() cmdStatus() end,
+})
+
+tab:AddButton({
+	Title = "Restore Gravity",
+	Description = "Puts Gravity back to 75 (one pass).",
+	ButtonText = "Restore",
+	Callback = function() cmdRestoreGravity() end,
 })
 
 tab:AddButton({
@@ -707,6 +706,7 @@ tab:AddButton({
 	Callback = function() cmdScan() end,
 })
 
+-- Last page: debug / advanced (Debug Keys, Run now, info, Stop).
 tab:AddToggle({
 	Title = "Debug Keys",
 	Description = "Show internal chatter in the console.",
@@ -722,8 +722,8 @@ tab:AddButton({
 })
 
 tab:AddLabel({
-	Title = "Reset",
-	Description = "Spread and Max Pen are cleared by rejoining. Press Stop before you rejoin.",
+	Title = BANNER,
+	Description = "Reset: Spread and Max Pen clear on rejoin. Press Stop before you rejoin.",
 })
 
 tab:AddButton({
@@ -732,6 +732,7 @@ tab:AddButton({
 	ButtonText = "Stop",
 	Callback = function() cmdStop() end,
 })
+
 
 syncToggles = function()
 	pcall(function()
