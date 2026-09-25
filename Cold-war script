@@ -1,9 +1,9 @@
 --============================================================================
 --  WEAPON MODS   -   Cold War [100 PLAYERS]
---  build 2026-09-24j
+--  build 2026-09-25m
 --============================================================================
 
-local BANNER = "Weapon Mods build 2026-09-24j"
+local BANNER = "Weapon Mods build 2026-09-25m"
 print(BANNER .. " - loading")
 
 -- stop a previous copy of this script (its watcher and its queue)
@@ -17,12 +17,20 @@ local SPREAD_TARGET       = 0      -- No Spread   -> Spread = 0
 local PEN_TARGET          = 10     -- Max Pen     -> Penetration = 10 (game max)
 local GRAVITY_TARGET      = 0      -- No Flatline -> Gravity = 0 (exact 0 drop)
 local GRAVITY_RESTORE     = 75     -- stock value
-local SETTLE_AFTER_CHANGE = 15     -- quiet seconds after a spawn / class change
-local MIN_AUTO_INTERVAL   = 90     -- seconds between automatic re-applies
-local CACHE_TTL           = 900    -- reuse a cache younger than this
+local SETTLE_AFTER_CHANGE = 15     -- if you ask for a change right after a spawn it
+                                   -- runs once you have settled (never by itself)
+local CACHE_TRUST         = 900    -- older than this the cache is re-read once (read
+                                   -- only, ms) before being written through - a
+                                   -- read-back, never a scan
 local SCAN_WARN           = "30-45" -- wait hint shown while the GC is scanned
-local PASS_WARN           = "30"    -- wait hint shown for a one-off setgc pass
 local HOLD_LOG_INTERVAL   = 10     -- repeat the "why am I waiting" line this often
+local HEARTBEAT_INTERVAL  = 60     -- one console line per minute (crash trail)
+-- cache verification: read a sample of the cache straight back out of memory
+-- (no writes at all) before trusting a cache the game may have rebuilt
+local VERIFY_SAMPLE   = 200        -- fields to read back (one per weapon table)
+local VERIFY_MIN_OK   = 4          -- fewer usable reads than this = unknown
+local VERIFY_MAX_FAIL = 0          -- any field that no longer matches = rebuilt
+local VERIFY_KEYS     = { "Damage", "MuzzleVelocity" }
 
 -- keys we actually change
 local CAPTURE_KEYS = { "Spread", "Penetration", "Gravity" }
@@ -36,7 +44,16 @@ local KEY_RANGE = {
 	Penetration = { min = 0.0001, max = 100 },
 	Gravity     = { min = 0.0001, max = 500 },
 }
--- names that pause heavy GC work (the game rebuilds weapon tables on these)
+-- the values we write. A field that already holds its target still counts as a
+-- weapon field, otherwise a fresh scan of an already-patched table comes back
+-- empty and the module would look broken after every respawn.
+local KEY_TARGETS = {
+	Spread      = SPREAD_TARGET,
+	Penetration = PEN_TARGET,
+	Gravity     = GRAVITY_TARGET,
+}
+-- with one of these open the game may be rebuilding its weapon tables, so
+-- queued GC work is held back until it is closed
 local MENU_BLOCK_PATTERNS = { "class selection", "equipment selection", "still loading" }
 
 --============================= SHARED STATE =================================
@@ -50,9 +67,11 @@ local WM = {
 	filterMode = "tables",   -- "tables" = weapon tables only, "range" = fallback
 	lastScan   = 0,
 	lastChange = os.clock(),
-	lastAuto   = 0,
-	needAuto   = false,
-	holdLogged = 0,
+	verifiedAt  = 0,    -- clock of the last scan / successful read-back
+	readType    = nil,  -- calibrated memory_read type (double / float / int)
+	lastVerdict = "no cache yet",
+	warnedUnknown = false,
+	holdLogged  = 0,
 	warnCount  = 0,     -- bumped by warn(); a job that warned gets a visible "done"
 	forceUntil = 0,
 	debug      = false,
@@ -153,14 +172,22 @@ local function ballisticsClient()
 	return ps:FindFirstChild("BallisticsClient")
 end
 
+-- writes only when the value really has to change, so the 1 Hz watcher is a
+-- read and not a write (a per-second write into a game value is a needless
+-- risk, and this way we also spot the game clearing the flag)
 local function setRecoil(on)
 	local bc = ballisticsClient()
-	if not bc then return false, "BallisticsClient not found (are you in a match?)" end
+	if not bc then return false, "BallisticsClient not found (are you in a match?)", 0 end
 	local v = bc:FindFirstChild("DebugShotsGui")
-	if not v then return false, "DebugShotsGui not found" end
-	local ok = pcall(function() v.Value = on and true or false end)
-	if not ok then return false, "could not write DebugShotsGui" end
-	return true, "DebugShotsGui = " .. tostring(on)
+	if not v then return false, "DebugShotsGui not found", 0 end
+	local want = on and true or false
+	local cur
+	local rok, rv = pcall(function() return v.Value end)
+	if rok then cur = rv end
+	if cur == want then return true, "DebugShotsGui is already " .. tostring(want), 0 end
+	local ok = pcall(function() v.Value = want end)
+	if not ok then return false, "could not write DebugShotsGui", 0 end
+	return true, "DebugShotsGui = " .. tostring(want), 1
 end
 
 --============================= TIME / GUARDS ================================
@@ -228,7 +255,11 @@ local function isEligible(e)
 	if not isNumericEntry(e) then return false end
 	local v = numericValueOf(e)
 	if not isFiniteNumber(v) then return false end
-	if v < rng.min or v > rng.max then return false end
+	-- a field that already holds our target stays eligible, so a fresh scan of
+	-- an already-patched table is not filtered down to nothing
+	local ours = KEY_TARGETS[e.key]
+	local alreadyOurs = (ours ~= nil and v == ours)
+	if (not alreadyOurs) and (v < rng.min or v > rng.max) then return false end
 	if WM.filterMode == "tables" then
 		local t = tableKeyOf(e)
 		if not t then return false end
@@ -271,23 +302,115 @@ local function rebuildWeaponSet(entries)
 	return set, matched, anyTableInfo
 end
 
+-- returns ok, fields written, error, stale
+-- "stale" means the cached addresses no longer point at live weapon tables, so
+-- the cache is thrown away instead of being written into
 local function applyCached(key, target)
-	if not WM.cache then return false, 0, "no cache" end
+	if not WM.cache then return false, 0, "no cache", false end
+	local expected = countEligible(WM.cache, key)
 	local t0 = clock()
 	local ok, res = pcall(applygc, WM.cache, key, target)
-	if not ok then return false, 0, tostring(res) end
+	if not ok then return false, 0, tostring(res), false end
 	local n = tonumber(res) or 0
-	dbg(string.format("%s: %d field(s) in %.2fs", key, n, clock() - t0))
-	return true, n, nil
+	dbg(string.format("%s: %d of %d field(s) in %.2fs", key, n, expected, clock() - t0))
+	if n == 0 and expected > 0 then
+		WM.cache = nil
+		WM.weaponSet = nil
+		dbg("cache addresses are dead (0 fields matched) - dropped the cache")
+		return false, 0, "the cached addresses are stale", true
+	end
+	return true, n, nil, false
 end
 
-local function setgcOne(key, target)
+-- usable = a scan or a successful read-back confirmed it recently. Time alone
+-- never marks a cache stale in a way that costs a scan: an old cache is read
+-- back first (see verifyCache), which is free.
+local function cacheValid()
+	if not WM.cache then return false end
+	if (clock() - WM.verifiedAt) >= CACHE_TRUST then return false end
+	return true
+end
+
+-- a cache that turned out to be dead is thrown away so the next explicit write
+-- scans again. The toggles stay exactly as the user left them.
+local function dropCache(reason)
+	if not WM.cache then return end
+	WM.cache = nil
+	WM.weaponSet = nil
+	dbg("cache dropped (" .. reason .. ")")
+end
+
+--====================== CACHE VERIFICATION (READ ONLY) ======================
+-- Reads a sample of the cached values straight back out of memory. There is no
+-- write anywhere in here, so the worst a misread can do is make us rescan.
+local function readAt(addr, typ)
+	local ok, v = pcall(memory_read, typ, addr)
+	if ok and type(v) == "number" then return v end
+	return nil
+end
+
+-- true = the field is still exactly what we scanned, false = it changed,
+-- nil = we cannot even address it (not counted either way)
+local function readMatches(e, expect)
+	local a = tonumber(e.addr)
+	if not a then return nil end
+	local order = { "double", "float", "int" }
+	if WM.readType then
+		local rest = { WM.readType }
+		for _, t in ipairs(order) do if t ~= WM.readType then table.insert(rest, t) end end
+		order = rest
+	end
+	local tol = math.max(1e-9, math.abs(expect) * 1e-6)
+	for _, t in ipairs(order) do
+		local v = readAt(a, t)
+		if v and math.abs(v - expect) <= tol then
+			WM.readType = t
+			return true
+		end
+	end
+	return false
+end
+
+-- "alive"   = the addresses still hold the same weapon values (safe to write)
+-- "dead"    = they hold something else (the game rebuilt its tables)
+-- "unknown" = not enough readable fields to judge (treated as dead)
+local function verifyCache()
+	if not WM.cache then return "unknown" end
 	local t0 = clock()
-	local ok, res = pcall(setgc, key, target)
-	if not ok then return false, 0, tostring(res) end
-	local n = tonumber(res) or 0
-	log(string.format("%s: %d field(s) set in %.1fs", key, n, clock() - t0))
-	return true, n, nil
+	local okn, fail, seen, tables = 0, 0, 0, {}
+	for _, e in ipairs(WM.cache) do
+		if seen >= VERIFY_SAMPLE or fail > VERIFY_MAX_FAIL then break end
+		if type(e) == "table" and isNumericEntry(e) then
+			local expect = numericValueOf(e)
+			local marker = false
+			for _, k in ipairs(VERIFY_KEYS) do if e.key == k then marker = true end end
+			if marker and isFiniteNumber(expect) and expect ~= 0 then
+				local t = tableKeyOf(e)
+				if not (t and tables[t]) then
+					if t then tables[t] = true end
+					local m = readMatches(e, expect)
+					if m ~= nil then
+						seen = seen + 1
+						if m then okn = okn + 1 else fail = fail + 1 end
+					end
+				end
+			end
+		end
+	end
+	local verdict
+	if fail > VERIFY_MAX_FAIL then
+		verdict = "dead"
+	elseif (okn + fail) < VERIFY_MIN_OK then
+		verdict = "unknown"
+	elseif okn >= VERIFY_MIN_OK then
+		verdict = "alive"
+	else
+		verdict = "unknown"
+	end
+	WM.lastVerdict = string.format("%s - %d of %d fields still match (%d changed, %.2fs, %s)",
+		verdict, okn, seen, fail, clock() - t0, tostring(WM.readType))
+	dbg("cache check: " .. WM.lastVerdict)
+	return verdict
 end
 
 --============================= HEAVY JOBS ===================================
@@ -300,14 +423,13 @@ end
 
 local function jobScan()
 	local t0 = clock()
-	warn("No Spread: scanning the GC now - do not touch anything for about " .. SCAN_WARN .. " seconds")
+	warn("scanning the GC now - do not touch anything, do not switch class / weapon for about " .. SCAN_WARN .. " seconds")
 	local keys = mergedScanKeys()
 	local ok, entries = pcall(getgc, keys)
 	if not ok then
 		WM.cache = nil
 		WM.weaponSet = nil
-		dbg("getgc failed: " .. tostring(entries))
-		fail("getgc did not accept the name list - using setgc instead")
+		fail("getgc failed: " .. tostring(entries))
 		return
 	end
 	if type(entries) ~= "table" then
@@ -323,10 +445,12 @@ local function jobScan()
 	local counts = {}
 	for _, k in ipairs(CAPTURE_KEYS) do counts[k] = 0 end
 
-	WM.cache      = entries
-	WM.weaponSet  = set
-	WM.scanKeys   = keys
-	WM.filterMode = "tables"
+	WM.cache       = entries
+	WM.weaponSet   = set
+	WM.scanKeys    = keys
+	WM.filterMode  = "tables"
+	WM.verifiedAt  = clock()
+	WM.lastVerdict = "fresh scan - trusted"
 	if (not anyTableInfo) or matched == 0 then
 		WM.filterMode = "range"
 		note("no weapon-table grouping available - falling back to value ranges")
@@ -342,117 +466,116 @@ local function jobScan()
 	note(string.format("scan complete - %d entries, %d weapon tables", total, matched))
 end
 
-local function ensureCache(force)
-	if WM.cache and not force and (clock() - WM.lastScan) < CACHE_TTL then
-		dbg("reusing cache from " .. string.format("%.0fs ago", clock() - WM.lastScan))
+-- Makes sure a usable cache exists. This is only ever reached from a toggle
+-- or a button - nothing calls it by itself. A cache that is not trusted is
+-- read back first (read only, milliseconds); a real rebuild costs one scan.
+local function ensureCache()
+	if cacheValid() then
+		dbg(string.format("reusing cache (last checked %.0fs ago)", clock() - WM.verifiedAt))
 		return
 	end
-	if WM.cache and (clock() - WM.lastScan) >= CACHE_TTL then
-		note("cache is old - scanning the GC again")
+	if WM.cache then
+		local verdict = verifyCache()
+		if verdict == "alive" then
+			WM.verifiedAt = clock()
+			note("cache still matches - re-using it (" .. WM.lastVerdict .. ")")
+			return
+		end
+		if verdict == "unknown" and not WM.warnedUnknown then
+			WM.warnedUnknown = true
+			warn("cannot read the cache back (unsafe Lua / memory_read off?) - one scan is needed before the next change")
+		end
+		dropCache(verdict == "dead" and "the cached weapon tables are gone (the game rebuilt them)" or "cache could not be verified")
 	end
 	jobScan()
 end
 
--- spread / max pen need the per-entry originals, so they use the cache
+-- the toggle that has to be on for a key to be worth writing
+local KEY_STATE = { Spread = "spread", Penetration = "pen", Gravity = "flat" }
+
+-- one cached write; a dead cache is rebuilt ONCE and the write retried, because
+-- the user asked for this value right now
+local function applyWithRetry(key, target)
+	ensureCache()
+	if not alive() then return false, 0, "player left the game" end
+	local ok, n, err, stale = applyCached(key, target)
+	if (not ok) and stale then
+		dbg("cache was stale - one fresh scan, then retry " .. key)
+		ensureCache()
+		if not alive() then return false, 0, "player left the game" end
+		ok, n, err = applyCached(key, target)
+	end
+	return ok, n, err
+end
+
+-- Spread / Max Pen / No Flatline all go through the scanned, weapon-table-only
+-- cache now. There is no unfiltered global write left in this script.
 local function jobApplyKey(key, target)
-	ensureCache(false)
-	if not alive() then dbg("apply aborted - player left the game"); return end
-	if not WM.cache then
-		-- no cache (scan refused or failed): one setgc pass still gets the job done
-		warn("no cache yet - one " .. key .. " pass, do not touch anything for about " .. PASS_WARN .. " seconds")
-		local sok, sn, serr = setgcOne(key, target)
-		if not sok then
-			fail("could not apply " .. key .. ": " .. tostring(serr))
-			return
-		end
-		note(string.format("%s now %s (%d field(s), one pass)", key, tostring(target), sn))
+	local st = KEY_STATE[key]
+	if st and not WM.state[st] then
+		dbg(key .. " job skipped - the module was switched off again")
 		return
 	end
-	local ok, n, err = applyCached(key, target)
+	local ok, n, err = applyWithRetry(key, target)
 	if not ok then
 		fail("could not apply " .. key .. ": " .. tostring(err))
+		return
+	end
+	if n == 0 then
+		warn(key .. ": no live weapon " .. key .. " field found yet - deploy into a match, then flip the module on again")
 		return
 	end
 	note(string.format("%s now %s (%d field(s))", key, tostring(target), n))
 end
 
--- flatline: never scans. Uses the cache when one already exists (instant),
--- otherwise exactly one setgc pass. getgc is never called from here.
 local function jobFlatline()
-	if not alive() then dbg("flatline aborted - player left the game"); return end
-	local ok, n, err
-	if WM.cache then
-		ok, n, err = applyCached("Gravity", GRAVITY_TARGET)
-		if ok then
-			note(string.format("No Flatline on - Gravity is %d (%d field(s), exact zero drop)", GRAVITY_TARGET, n))
-			return
-		end
-		note("cached apply failed (" .. tostring(err) .. ") - using one setgc pass instead")
-		if not alive() then return end
-	end
-	warn("No Flatline: one Gravity pass now - do not touch anything for about " .. PASS_WARN .. " seconds")
-	ok, n, err = setgcOne("Gravity", GRAVITY_TARGET)
-	if not ok then
-		fail("could not set Gravity: " .. tostring(err))
-		return
-	end
-	if n == 0 then
-		warn("No Flatline: no Gravity fields found yet - deploy into a match, then toggle off and on again")
-	else
-		note(string.format("No Flatline on - Gravity is %d (%d field(s), exact zero drop)", GRAVITY_TARGET, n))
-	end
+	jobApplyKey("Gravity", GRAVITY_TARGET)
 end
 
 local function jobRestoreGravity()
-	if not alive() then dbg("restore aborted - player left the game"); return end
-	local ok, n, err
-	if WM.cache then
-		ok, n, err = applyCached("Gravity", GRAVITY_RESTORE)
-		if not ok then
-			note("cached restore failed (" .. tostring(err) .. ") - using one setgc pass instead")
-			if not alive() then return end
-		end
-	end
-	if not ok then
-		warn("Restore Gravity: one pass now - do not touch anything for about " .. PASS_WARN .. " seconds")
-		ok, n, err = setgcOne("Gravity", GRAVITY_RESTORE)
-	end
+	local ok, n, err = applyWithRetry("Gravity", GRAVITY_RESTORE)
 	if not ok then
 		fail("could not restore Gravity: " .. tostring(err))
 		return
 	end
 	WM.state.flat = false
 	syncToggles()
+	if n == 0 then
+		warn("Restore Gravity: no live Gravity field found - deploy into a match first")
+		return
+	end
 	note(string.format("Gravity restored to %d (%d field(s))", GRAVITY_RESTORE, n))
 end
 
--- cache only, instant, never scans and never calls setgc
-local function jobReapply(useCacheOnly)
-	local did = {}
-	if not WM.cache then
-		note("re-apply skipped: no cache yet - toggle No Spread or press Scan GC once")
+-- Puts every module that is switched on back the way the user left it. Only
+-- the Re-apply button calls this now - nothing runs it by itself. The cache is
+-- read back first, so it is instant while the game is still using the same
+-- tables, and only a real rebuild costs one fresh scan.
+local function jobRestoreMods()
+	local wanted = {}
+	if WM.state.spread then table.insert(wanted, { "Spread", SPREAD_TARGET, "spread" }) end
+	if WM.state.pen    then table.insert(wanted, { "Penetration", PEN_TARGET, "pen" }) end
+	if WM.state.flat   then table.insert(wanted, { "Gravity", GRAVITY_TARGET, "flat" }) end
+	if #wanted == 0 then
+		dbg("restore: no module is switched on")
 		return
 	end
-	if WM.state.spread then
-		local ok, n = applyCached("Spread", SPREAD_TARGET)
-		if ok then table.insert(did, "Spread=" .. n) end
-	end
-	if WM.state.pen then
-		local ok, n = applyCached("Penetration", PEN_TARGET)
-		if ok then table.insert(did, "Penetration=" .. n) end
-	end
-	if WM.state.flat then
-		local g = countEligible(WM.cache, "Gravity")
-		if g > 0 then
-			local ok, n = applyCached("Gravity", GRAVITY_TARGET)
-			if ok then table.insert(did, "Gravity=" .. n) end
-		elseif not useCacheOnly then
-			dbg("cache holds no Gravity field - flatline stays on the last setgc pass")
+	local did, problems = {}, {}
+	for _, m in ipairs(wanted) do
+		local key, target, st = m[1], m[2], m[3]
+		local ok, n, err = applyWithRetry(key, target)
+		if ok and n > 0 then
+			table.insert(did, key .. "=" .. n)
+		else
+			WM.state[st] = false
+			table.insert(problems, key .. " (" .. tostring(err or "no live field") .. ")")
 		end
 	end
-	WM.lastAuto = clock()
-	dbg("re-apply done (cache, instant): " .. (#did > 0 and table.concat(did, " ") or "nothing to do"))
-	if #did > 0 and not useCacheOnly then note("Re-applied from cache: " .. table.concat(did, " ")) end
+	if #problems > 0 then
+		syncToggles()
+		warn("could not put back " .. table.concat(problems, ", ") .. " - that module was switched off, flip it to retry")
+	end
+	if #did > 0 then note("restored: " .. table.concat(did, " ")) end
 end
 
 --============================= OPERATION QUEUE ==============================
@@ -537,7 +660,8 @@ local function toggle(key, on)
 	end
 	if key == "flat" then
 		if on then
-			-- never scans: instant from a warm cache, otherwise one setgc pass
+			-- uses the shared cache: instant when it is warm, otherwise the same one
+			-- scan as No Spread / Max Pen
 			enqueue("No Flatline ON (Gravity -> " .. GRAVITY_TARGET .. ")", jobFlatline)
 		else
 			note("No Flatline off - gravity stays " .. GRAVITY_TARGET .. " until you press Restore Gravity.")
@@ -549,8 +673,8 @@ end
 --============================= CONSOLE COMMANDS =============================
 local function cacheSummary()
 	if not WM.cache then return "none" end
-	return string.format("%d entries, %.0fs old, mode=%s, Spread=%d Pen=%d Grav=%d",
-		#WM.cache, clock() - WM.lastScan, WM.filterMode,
+	return string.format("%d entries, %.0fs old, mode=%s, valid=%s, Spread=%d Pen=%d Grav=%d",
+		#WM.cache, clock() - WM.lastScan, WM.filterMode, tostring(cacheValid()),
 		countEligible(WM.cache, "Spread"), countEligible(WM.cache, "Penetration"),
 		countEligible(WM.cache, "Gravity"))
 end
@@ -572,6 +696,10 @@ local function cmdStatus()
 		tostring(menuGuiName()), settleLeft(), WM.placeId))
 	print(string.format("  guard: %s", tostring(guardReason()) or "SAFE - GC may be touched"))
 	print(string.format("  cache: %s", cacheSummary()))
+	-- read-only cache check: press Status after a death to see whether the cached
+	-- addresses are still live. No scan and no write happens in here.
+	if WM.cache and not WM.busy then pcall(verifyCache) end
+	print(string.format("  cache check: %s", WM.lastVerdict))
 	print("----------------------------------------------------------")
 end
 
@@ -602,7 +730,7 @@ local function cmdRestoreGravity()
 end
 
 local function cmdReapply()
-	enqueue("Re-apply now (cache)", function() jobReapply(false) end)
+	enqueue("Re-apply / restore mods", jobRestoreMods)
 end
 
 local function cmdScan()
@@ -658,7 +786,7 @@ ToggleObjs.recoil = tab:AddToggle({
 
 ToggleObjs.spread = tab:AddToggle({
 	Title = "No Spread",
-	Description = "Spread = 0. First press scans the GC (about 20-45s).",
+	Description = "Spread = 0. Needs the shared cache: scans the GC the first time (20-45s).",
 	Default = WM.state.spread,
 	Callback = function(v) toggle("spread", v) end,
 })
@@ -672,7 +800,7 @@ ToggleObjs.pen = tab:AddToggle({
 
 ToggleObjs.flat = tab:AddToggle({
 	Title = "No Flatline",
-	Description = "Gravity = 0, exact zero bullet drop. Instant from cache, otherwise one pass.",
+	Description = "Gravity = 0, exact zero bullet drop. Instant once the cache is warm.",
 	Default = WM.state.flat,
 	Callback = function(v) toggle("flat", v) end,
 })
@@ -687,21 +815,21 @@ tab:AddButton({
 
 tab:AddButton({
 	Title = "Restore Gravity",
-	Description = "Puts Gravity back to 75 (one pass).",
+	Description = "Puts Gravity back to 75 using the cache (scans once if there is none).",
 	ButtonText = "Restore",
 	Callback = function() cmdRestoreGravity() end,
 })
 
 tab:AddButton({
 	Title = "Re-apply now",
-	Description = "Instant, from the cache. No scan, no Gravity pass.",
+	Description = "Only if a stat ever stops working. Instant while the cache matches (read back first), one scan only if the game rebuilt its tables.",
 	ButtonText = "Re-apply",
 	Callback = function() cmdReapply() end,
 })
 
 tab:AddButton({
 	Title = "Scan GC",
-	Description = "Warms the cache on purpose (20-45s, do not toggle during it).",
+	Description = "Normally only needed once, the first time. 20-45s - do not toggle during it.",
 	ButtonText = "Scan",
 	Callback = function() cmdScan() end,
 })
@@ -723,7 +851,7 @@ tab:AddButton({
 
 tab:AddLabel({
 	Title = BANNER,
-	Description = "Reset: Spread and Max Pen clear on rejoin. Press Stop before you rejoin.",
+	Description = "Dying and class swaps do nothing now: nothing is rescanned or re-applied, the mods stay as you left them. Press Stop before you rejoin.",
 })
 
 tab:AddButton({
@@ -764,6 +892,7 @@ WM_Stop           = cmdStop
 --============================= WATCHER ======================================
 task.spawn(function()
 	local gone = 0
+	local hb = clock()
 	while not WM.stopped do
 		task.wait(1)
 		if WM.stopped then break end
@@ -784,25 +913,41 @@ task.spawn(function()
 			end
 		else
 			gone = 0
+			-- A respawn, a death, a class swap or the class menu is deliberately a
+			-- NO-OP here: no rescan, no re-apply, no cache drop, no queueing. The
+			-- cache and the toggles stay exactly as they are, so the patched values
+			-- just keep going. The only thing noted is the moment it happened, so
+			-- queued work still waits for the spawn / settle to finish first.
 			local ch = p.Character
 			if ch ~= WM.lastChar then
 				WM.lastChar = ch
 				WM.lastChange = clock()
-				WM.needAuto = true
-				dbg(string.format("spawn / class change - holding GC operations for %ds", SETTLE_AFTER_CHANGE))
+				dbg("character changed - nothing to do, the mods stay as they are")
 			end
-			if WM.state.recoil then setRecoil(true) end
-			if WM.needAuto and alive() and guardReason() == nil
-				and (clock() - WM.lastAuto) >= MIN_AUTO_INTERVAL then
-				WM.needAuto = false
-				if WM.state.spread or WM.state.pen or WM.state.flat then
-					enqueue("auto re-apply (cache)", function() jobReapply(true) end)
-				end
+			-- No Recoil: checked every second, written only if the game cleared it
+			if WM.state.recoil then
+				local _, msg, wrote = setRecoil(true)
+				if wrote == 1 then dbg("No Recoil: " .. tostring(msg)) end
+			end
+			-- crash trail: the operation in flight, the cache state, memory in use
+			if (clock() - hb) >= HEARTBEAT_INTERVAL then
+				hb = clock()
+				local kb, mb
+				pcall(function() kb = gcinfo() end)
+				pcall(function() mb = game:GetService("Stats"):GetTotalMemoryUsageMb() end)
+				if type(kb) ~= "number" then kb = nil end
+				if type(mb) ~= "number" then mb = nil end
+				local c = "none"
+				if WM.cache then c = cacheValid() and "ready" or "due a read-back" end
+				log(string.format("heartbeat - lastOp=%s, queue=%d, cache=%s, lua=%s, client=%s",
+					WM.lastOp, #WM.queue, c,
+					kb and string.format("%.0fKB", kb) or "n/a",
+					mb and string.format("%.0fMB", mb) or "n/a"))
 			end
 		end
 	end
 end)
 
-dbg("ready - No Flatline never scans, Spread and Max Pen share one scan")
-log("ready - right shift opens the menu. Press Stop before you rejoin.")
-notify("Weapon Mods", "Loaded. Press Stop before you rejoin.", "success", 6)
+dbg("ready - writes only go through a live cache, heartbeat every 60s")
+log("ready - right shift opens the menu. Death / class swap changes nothing; press Stop before you rejoin.")
+notify("Weapon Mods", "Loaded. Death and class swaps change nothing now.", "success", 6)
