@@ -1,9 +1,9 @@
 --============================================================================
 --  WEAPON MODS   -   Cold War [100 PLAYERS]
---  build 2026-09-25m
+--  build 2026-09-25r
 --============================================================================
 
-local BANNER = "Weapon Mods build 2026-09-25m"
+local BANNER = "Weapon Mods build 2026-09-25r"
 print(BANNER .. " - loading")
 
 -- stop a previous copy of this script (its watcher and its queue)
@@ -15,13 +15,21 @@ end)
 --=============================== CONFIG =====================================
 local SPREAD_TARGET       = 0      -- No Spread   -> Spread = 0
 local PEN_TARGET          = 10     -- Max Pen     -> Penetration = 10 (game max)
-local GRAVITY_TARGET      = 0      -- No Flatline -> Gravity = 0 (exact 0 drop)
-local GRAVITY_RESTORE     = 75     -- stock value
+-- No Flatline -> the bullet-drop gravity, written every time the module goes
+-- on. Not 0: a rifle is sighted in with the bore tilted a hair up, so with an
+-- exact 0 drop the round flies straight along that raised bore and looks like
+-- it climbs. A whisker above 0 is what flies flat; 0.1 is that value in q (p
+-- used 0.2). One fixed number, so No Flatline is a plain toggle.
+local DROP_TARGET         = 0.1    -- No Flatline -> drop gravity = 0.1
+local GRAVITY_RESTORE     = 75     -- fallback stock value; the real one is
+                                   -- remembered from the scan per field
 local SETTLE_AFTER_CHANGE = 15     -- if you ask for a change right after a spawn it
                                    -- runs once you have settled (never by itself)
-local CACHE_TRUST         = 900    -- older than this the cache is re-read once (read
-                                   -- only, ms) before being written through - a
-                                   -- read-back, never a scan
+local CACHE_TRUST         = 900    -- "valid" in the Status line means verified within
+                                   -- this many seconds (display only - every write
+                                   -- re-reads the cache first, see VERIFY_FRESH)
+local VERIFY_FRESH        = 5      -- a read-back younger than this is reused, so one job
+                                   -- writing several keys only verifies once
 local SCAN_WARN           = "30-45" -- wait hint shown while the GC is scanned
 local HOLD_LOG_INTERVAL   = 10     -- repeat the "why am I waiting" line this often
 local HEARTBEAT_INTERVAL  = 60     -- one console line per minute (crash trail)
@@ -29,7 +37,10 @@ local HEARTBEAT_INTERVAL  = 60     -- one console line per minute (crash trail)
 -- (no writes at all) before trusting a cache the game may have rebuilt
 local VERIFY_SAMPLE   = 200        -- fields to read back (one per weapon table)
 local VERIFY_MIN_OK   = 4          -- fewer usable reads than this = unknown
-local VERIFY_MAX_FAIL = 0          -- any field that no longer matches = rebuilt
+local VERIFY_MIN_FAIL = 3          -- this many changed fields is always a rebuild
+local VERIFY_MAX_FRAC = 0.25       -- ...or a quarter of the sample, whichever is more.
+                                   -- Not 0: one stat the game moved by itself must not
+                                   -- force a 30-45s rescan before every single write
 local VERIFY_KEYS     = { "Damage", "MuzzleVelocity" }
 
 -- keys we actually change
@@ -38,11 +49,38 @@ local CAPTURE_KEYS = { "Spread", "Penetration", "Gravity" }
 local MARKER_KEYS  = { "Spread", "Penetration", "Gravity", "Damage", "MuzzleVelocity",
                        "Ammo", "ReloadTime", "ShotAmount", "Recoil" }
 local MIN_MARKERS  = 2
+-- The bullet-drop gravity is NOT a per-weapon field in this game, so No
+-- Flatline cannot rely on the weapon-table grouping. These are the names a
+-- ballistics config realistically stores it under. "gravity" = the drop
+-- gravity itself (75 here), "mult" = a multiplier on the game gravity (1
+-- normally). Both mean the same thing to us: 0 = no drop at all.
+local GRAVITY_KEYS = {
+	{ "Gravity",                 "gravity" },
+	{ "gravity",                 "gravity" },
+	{ "GRAVITY",                 "gravity" },
+	{ "BulletGravity",           "gravity" },
+	{ "ProjectileGravity",       "gravity" },
+	{ "BallisticGravity",        "gravity" },
+	{ "WorldGravity",            "gravity" },
+	{ "GlobalGravity",           "gravity" },
+	{ "GravityValue",            "gravity" },
+	{ "Grav",                    "gravity" },
+	{ "GravityScale",            "mult" },
+	{ "GravityMultiplier",       "mult" },
+	{ "GravityMult",             "mult" },
+	{ "GravityFactor",           "mult" },
+	{ "BulletGravityMultiplier", "mult" },
+	{ "DropMultiplier",          "mult" },
+	{ "DropScale",               "mult" },
+}
+local GRAVITY_BAND_LOW  = 0.25  -- a drop gravity is stored as the game gravity
+local GRAVITY_BAND_HIGH = 4     -- itself (75) or a small multiplier near 1
+local MULT_MAX          = 10    -- above this it is not a multiplier
 -- sanity ranges so we never write into something that is not a weapon stat
 local KEY_RANGE = {
 	Spread      = { min = 0.0001, max = 500 },
 	Penetration = { min = 0.0001, max = 100 },
-	Gravity     = { min = 0.0001, max = 500 },
+	Gravity     = { min = 0, max = 500 },
 }
 -- the values we write. A field that already holds its target still counts as a
 -- weapon field, otherwise a fresh scan of an already-patched table comes back
@@ -50,8 +88,19 @@ local KEY_RANGE = {
 local KEY_TARGETS = {
 	Spread      = SPREAD_TARGET,
 	Penetration = PEN_TARGET,
-	Gravity     = GRAVITY_TARGET,
+	Gravity     = DROP_TARGET,
 }
+-- every gravity-style name: what kind it is and its trust order
+local GRAVITY_KIND  = {}
+local GRAVITY_ORDER = {}
+for _, g in ipairs(GRAVITY_KEYS) do
+	GRAVITY_KIND[g[1]]  = g[2]
+	GRAVITY_ORDER[#GRAVITY_ORDER + 1] = g[1]
+	-- min 0, not 0.0001: "no drop at all" is a value we deliberately write
+	KEY_RANGE[g[1]]     = (g[2] == "gravity") and { min = 0, max = 500 }
+		or { min = 0, max = MULT_MAX }
+	KEY_TARGETS[g[1]]   = DROP_TARGET
+end
 -- with one of these open the game may be rebuilding its weapon tables, so
 -- queued GC work is held back until it is closed
 local MENU_BLOCK_PATTERNS = { "class selection", "equipment selection", "still loading" }
@@ -78,7 +127,16 @@ local WM = {
 	lastOp     = "(idle)",
 	lastChar   = nil,
 	placeId    = game.PlaceId,
-	state      = { recoil = false, spread = false, pen = false, flat = false },
+	state      = { recoil = false, spread = false, pen = false, flat = false,
+	               worldflat = false },
+	-- gravity bookkeeping: which gravity-style keys the game really has, their
+	-- stock values (captured while the cache is fresh, before any write) and the
+	-- ones we patched, so Restore puts back the right numbers
+	gravKeys    = nil,
+	orig        = {},
+	gravPatched = {},
+	worldStock  = nil,
+	dropGravity = DROP_TARGET,    -- No Flatline target (fixed)
 }
 
 local function clock() return os.clock() end
@@ -277,6 +335,93 @@ local function countEligible(entries, key)
 	return n
 end
 
+-- how many numeric values sit under this key in the cache at all. applygc
+-- writes every entry it finds under a key (it does not know about our weapon
+-- table filter), so for the gravity keys this - not countEligible - is the
+-- number that matters, both for reporting and for spotting a dead cache.
+local function countNumeric(entries, key)
+	if not entries then return 0 end
+	local n = 0
+	for _, e in ipairs(entries) do
+		if type(e) == "table" and e.key == key and isNumericEntry(e) then n = n + 1 end
+	end
+	return n
+end
+
+-- the first numeric value we see under a key is the stock value, because a
+-- scan only ever runs before a write. 0 is never stock (that would be us), so
+-- a 0 sample is ignored rather than remembered.
+local function originalValue(entries, key)
+	if not entries then return nil end
+	for _, e in ipairs(entries) do
+		if type(e) == "table" and e.key == key and isNumericEntry(e) then
+			local v = numericValueOf(e)
+			if isFiniteNumber(v) and v > 0 then return v end
+		end
+	end
+	return nil
+end
+
+-- the game's own gravity, used only to judge whether a value looks like a
+-- bullet-drop gravity. It is never written to (except by the explicit
+-- "World gravity 0" toggle the user has to switch on themselves).
+local function gameGravity()
+	local g
+	pcall(function() g = workspace.Gravity end)
+	if type(g) ~= "number" or not (g > 0) then return GRAVITY_RESTORE end
+	return g
+end
+
+-- does this look like the gravity the drop is computed from?
+local function looksLikeDropGravity(v, kind)
+	if not isFiniteNumber(v) then return false end
+	-- near zero is effectively flat, and that is the value we write ourselves
+	if v <= 1 then return true end
+	if v < 0 then return false end
+	if kind == "mult" then return v <= MULT_MAX end
+	local g = gameGravity()
+	return v >= g * GRAVITY_BAND_LOW and v <= g * GRAVITY_BAND_HIGH
+end
+
+-- one console line per gravity-style name that exists in the cache. This is
+-- the line that says whether the drop gravity is a GC value at all.
+local function gravityProbe(entries)
+	local lines = {}
+	for _, key in ipairs(GRAVITY_ORDER) do
+		local n = countNumeric(entries, key)
+		if n > 0 then
+			local samples, inTables = {}, 0
+			for _, e in ipairs(entries) do
+				if type(e) == "table" and e.key == key and isNumericEntry(e) then
+					local t = tableKeyOf(e)
+					if t and WM.weaponSet and WM.weaponSet[t] then inTables = inTables + 1 end
+					if #samples < 3 then
+						local v = numericValueOf(e)
+						if isFiniteNumber(v) then
+							samples[#samples + 1] = string.format("%g", v)
+						end
+					end
+				end
+			end
+			local judge = ""
+			if #samples > 0 then
+				judge = looksLikeDropGravity(tonumber(samples[1]), GRAVITY_KIND[key] or "gravity")
+					and " <- likely the drop gravity" or " <- not a drop value"
+			end
+			lines[#lines + 1] = string.format("%s: %d numeric (%d in weapon tables, values %s)%s",
+				key, n, inTables,
+				#samples > 0 and table.concat(samples, ", ") or "n/a", judge)
+		end
+	end
+	return lines
+end
+
+-- expected = the number of entries applygc can realistically write for a key
+local function expectedCount(entries, key)
+	if GRAVITY_KIND[key] then return countNumeric(entries, key) end
+	return countEligible(entries, key)
+end
+
 local function rebuildWeaponSet(entries)
 	local groups, anyTableInfo = {}, false
 	for _, e in ipairs(entries) do
@@ -307,12 +452,20 @@ end
 -- the cache is thrown away instead of being written into
 local function applyCached(key, target)
 	if not WM.cache then return false, 0, "no cache", false end
-	local expected = countEligible(WM.cache, key)
+	local expected = expectedCount(WM.cache, key)
 	local t0 = clock()
 	local ok, res = pcall(applygc, WM.cache, key, target)
 	if not ok then return false, 0, tostring(res), false end
 	local n = tonumber(res) or 0
 	dbg(string.format("%s: %d of %d field(s) in %.2fs", key, n, expected, clock() - t0))
+	-- applygc writes every entry it finds under a key, not just the ones inside the
+	-- matched weapon tables: expected is what we meant to write, n is what it
+	-- really touched. More written than expected = it reached past the weapon
+	-- tables, which is worth one line in the console.
+	if n > expected then
+		log(string.format("%s: wrote %d field(s), more than the %d inside the matched weapon tables",
+			key, n, expected))
+	end
 	if n == 0 and expected > 0 then
 		WM.cache = nil
 		WM.weaponSet = nil
@@ -379,7 +532,7 @@ local function verifyCache()
 	local t0 = clock()
 	local okn, fail, seen, tables = 0, 0, 0, {}
 	for _, e in ipairs(WM.cache) do
-		if seen >= VERIFY_SAMPLE or fail > VERIFY_MAX_FAIL then break end
+		if seen >= VERIFY_SAMPLE then break end
 		if type(e) == "table" and isNumericEntry(e) then
 			local expect = numericValueOf(e)
 			local marker = false
@@ -397,8 +550,11 @@ local function verifyCache()
 			end
 		end
 	end
+	-- judge on a fraction, not a single field: a rebuilt table changes nearly
+	-- every value, while a live one can legitimately drift in one or two
+	local allowed = math.max(VERIFY_MIN_FAIL, math.floor(seen * VERIFY_MAX_FRAC))
 	local verdict
-	if fail > VERIFY_MAX_FAIL then
+	if fail > allowed then
 		verdict = "dead"
 	elseif (okn + fail) < VERIFY_MIN_OK then
 		verdict = "unknown"
@@ -407,8 +563,8 @@ local function verifyCache()
 	else
 		verdict = "unknown"
 	end
-	WM.lastVerdict = string.format("%s - %d of %d fields still match (%d changed, %.2fs, %s)",
-		verdict, okn, seen, fail, clock() - t0, tostring(WM.readType))
+	WM.lastVerdict = string.format("%s - %d of %d fields still match (%d changed, limit %d, %.2fs, %s)",
+		verdict, okn, seen, fail, allowed, clock() - t0, tostring(WM.readType))
 	dbg("cache check: " .. WM.lastVerdict)
 	return verdict
 end
@@ -418,6 +574,9 @@ local function mergedScanKeys()
 	local keys = {}
 	for _, k in ipairs(CAPTURE_KEYS) do table.insert(keys, k) end
 	for _, k in ipairs({ "Damage", "MuzzleVelocity" }) do table.insert(keys, k) end
+	-- every gravity name the drop could be stored under: same scan, no extra
+	-- wait for the user
+	for _, k in ipairs(GRAVITY_ORDER) do table.insert(keys, k) end
 	return keys
 end
 
@@ -458,9 +617,44 @@ local function jobScan()
 	for _, k in ipairs(CAPTURE_KEYS) do counts[k] = countEligible(entries, k) end
 	WM.lastScan = clock()
 
+	-- gravity: remember the stock value of every gravity-style key that exists
+	-- (the cache is fresh right now and nothing has been written yet) and print
+	-- the probe line, so a No Flatline that still does nothing is diagnosable
+	WM.gravKeys = {}
+	for _, key in ipairs(GRAVITY_ORDER) do
+		if countNumeric(entries, key) > 0 then
+			WM.gravKeys[#WM.gravKeys + 1] = key
+			local o = originalValue(entries, key)
+			local kept = WM.orig[key]
+			if o ~= nil and (kept == nil or (kept == WM.dropGravity and o ~= WM.dropGravity)) then
+				WM.orig[key] = o
+			end
+		end
+	end
+	-- plausible names first, so the report names the real suspect at the front
+	table.sort(WM.gravKeys, function(a, b)
+		local la = looksLikeDropGravity(WM.orig[a], GRAVITY_KIND[a])
+		local lb = looksLikeDropGravity(WM.orig[b], GRAVITY_KIND[b])
+		if la ~= lb then return la end
+		return a < b
+	end)
+	local probe = gravityProbe(entries)
+	if #probe > 0 then
+		for _, line in ipairs(probe) do log("gravity probe: " .. line) end
+	else
+		log("gravity probe: no Gravity-style field in the GC - the drop is not stored in a Lua table here")
+	end
+
+	-- one always-visible line per scan, so "does this stat even exist in the GC?"
+	-- can be answered from the scan itself, without Debug Keys
+	log(string.format("scan report: Spread %d/%d, Penetration %d/%d, Gravity %d (in weapon tables / with that name)",
+		countEligible(entries, "Spread"), countNumeric(entries, "Spread"),
+		countEligible(entries, "Penetration"), countNumeric(entries, "Penetration"),
+		countNumeric(entries, "Gravity")))
 	dbg(string.format("scan: %d entries in %.1fs, weapon tables matched: %d", total, clock() - t0, matched))
-	dbg(string.format("cache ready: Spread=%d Penetration=%d Gravity=%d",
-		counts.Spread, counts.Penetration, counts.Gravity))
+	dbg(string.format("cache ready: Spread=%d/%d Penetration=%d/%d Gravity=%d",
+		counts.Spread, countNumeric(entries, "Spread"),
+		counts.Penetration, countNumeric(entries, "Penetration"), counts.Gravity))
 	dbg(string.format("GC scan done in %.1fs - %d entries, %d weapon table(s), mode=%s",
 		clock() - t0, total, matched, WM.filterMode))
 	note(string.format("scan complete - %d entries, %d weapon tables", total, matched))
@@ -470,8 +664,14 @@ end
 -- or a button - nothing calls it by itself. A cache that is not trusted is
 -- read back first (read only, milliseconds); a real rebuild costs one scan.
 local function ensureCache()
-	if cacheValid() then
-		dbg(string.format("reusing cache (last checked %.0fs ago)", clock() - WM.verifiedAt))
+	-- A read-back that just happened (the same job writing several keys) is
+	-- reused. Anything older than VERIFY_FRESH is read straight out of memory
+	-- again before a single value is written: the game rebuilds its gun tables
+	-- on respawn / weapon changes, and writing into a rebuilt cache lands in
+	-- recycled memory that can still report success. Read only - milliseconds -
+	-- so the only thing this can ever cost is one scan, when it is really needed.
+	if WM.cache and (clock() - WM.verifiedAt) < VERIFY_FRESH then
+		dbg(string.format("cache verified %.1fs ago - writing through it", clock() - WM.verifiedAt))
 		return
 	end
 	if WM.cache then
@@ -522,29 +722,177 @@ local function jobApplyKey(key, target)
 		return
 	end
 	if n == 0 then
-		warn(key .. ": no live weapon " .. key .. " field found yet - deploy into a match, then flip the module on again")
+		-- two very different reasons for "nothing written": the game has no field
+		-- with that name at all (the module cannot work), or the fields are there
+		-- but the cache no longer points at the live tables
+		local have = countNumeric(WM.cache, key)
+		if have == 0 then
+			warn(key .. ": the GC holds no field called " .. key .. " - deploy into a match with the weapon out, then flip the module on again")
+		else
+			warn(string.format("%s: %d field(s) with that name, but none took the write - the cached addresses look stale. Press Re-apply now, or rejoin and flip it on again",
+				key, have))
+		end
 		return
 	end
-	note(string.format("%s now %s (%d field(s))", key, tostring(target), n))
+	-- always in the console (F9), no popup: this is the only visible proof that
+	-- the module did anything, because the change itself cannot be seen in game
+	log(string.format("%s -> %s: %d field(s) written", key, tostring(target), n))
 end
 
+local function worldGravityNow()
+	local g
+	pcall(function() g = workspace.Gravity end)
+	return (type(g) == "number") and g or nil
+end
+
+-- the gravity keys this cache can write to, in trust order: what the scan saw
+-- first, and if the scan saw none then plain "Gravity" is still worth a call
+local function gravityKeyList()
+	local out = {}
+	for _, k in ipairs(WM.gravKeys or {}) do out[#out + 1] = k end
+	if #out == 0 then out[1] = "Gravity" end
+	return out
+end
+
+-- what a multiplier-style field has to hold for the bullet's drop gravity to
+-- end up at the drop target: a multiplier on the game gravity (75) is that
+-- fraction of it, an absolute gravity field just gets the number itself
+local function multForValue(v)
+	local g = gameGravity()
+	if not (g and g > 0) then g = GRAVITY_RESTORE end
+	return v / g
+end
+
+-- The fields this write touches and the number each one gets: every
+-- gravity-style field the scan found. An absolute gravity field gets the drop
+-- target itself, a multiplier field gets its share of the game gravity.
+local function gravityWritePlan(target, mode)
+	local plan = {}
+	for _, key in ipairs(gravityKeyList()) do
+		if key then
+			local kind = GRAVITY_KIND[key] or "gravity"
+			local value
+			if mode == "restore" then
+				value = WM.orig[key]
+				if value == nil or value <= 0 then
+					value = (kind == "mult") and 1 or GRAVITY_RESTORE
+				end
+			elseif kind == "mult" then
+				value = multForValue(target)
+			else
+				value = target
+			end
+			plan[#plan + 1] = { key, value }
+		end
+	end
+	return plan
+end
+
+-- Writes the drop target - or the stock values back - to the planned gravity
+-- fields. Returns fields written, a readable report, how many keys were worth
+-- trying, and an error.
+local function applyGravityFamily(target, mode)
+	ensureCache()
+	if not alive() then return 0, {}, 0, "player left the game" end
+	local total, parts, planned = 0, {}, 0
+	for _, item in ipairs(gravityWritePlan(target, mode)) do
+		local key, value = item[1], item[2]
+		local n = countNumeric(WM.cache, key)
+		-- a key with nothing in the cache is only worth the call while setting
+		-- the flat value: that is how a key the scan missed is still caught
+		if n > 0 or mode == "flat" then
+			planned = planned + 1
+			local ok, wrote, err = applyWithRetry(key, value)
+			if not ok then
+				parts[#parts + 1] = key .. " failed (" .. tostring(err) .. ")"
+			else
+				total = total + wrote
+				parts[#parts + 1] = string.format("%s=%d->%g", key, wrote, value)
+				if wrote > 0 then WM.gravPatched[key] = true end
+			end
+		else
+			parts[#parts + 1] = key .. " not in the cache"
+		end
+	end
+	return total, parts, planned, nil
+end
+
+-- Explicit and off by default: writes workspace.Gravity on your own client.
+local function cmdWorldFlat(on)
+	WM.state.worldflat = on and true or false
+	if on then
+		local cur = worldGravityNow()
+		if WM.worldStock == nil then
+			WM.worldStock = (cur and cur > 0) and cur or GRAVITY_RESTORE
+		end
+		local ok, err = pcall(function() workspace.Gravity = 0 end)
+		if not ok then
+			WM.state.worldflat = false
+			syncToggles()
+			fail("could not change world gravity: " .. tostring(err))
+			return
+		end
+		log("world gravity = 0 (client side only)")
+		warn(string.format("world gravity is 0 now (stock %g) - if your character floats or the game complains, flip this off at once", WM.worldStock))
+	else
+		local back = WM.worldStock
+		if back ~= nil then
+			local ok, err = pcall(function() workspace.Gravity = back end)
+			if ok then
+				log(string.format("world gravity back to %g", back))
+			else
+				fail("could not restore world gravity: " .. tostring(err))
+			end
+			WM.worldStock = nil
+		end
+	end
+end
+
+-- The drop gravity is not a gun stat, so it does not live in the weapon
+-- tables the scan groups. These helpers write the drop target (or the stock
+-- values back) to whichever gravity-style names the game really has.
+
 local function jobFlatline()
-	jobApplyKey("Gravity", GRAVITY_TARGET)
+	if not WM.state.flat then
+		dbg("Gravity job skipped - the module was switched off again")
+		return
+	end
+	local total, parts, planned, err = applyGravityFamily(WM.dropGravity, "flat")
+	if err then
+		fail("could not apply No Flatline: " .. tostring(err))
+		return
+	end
+	if total == 0 then
+		warn("No Flatline: nothing to write (" .. table.concat(parts, ", ")
+			.. ") - if the probe line said there is no Gravity-style field, use World gravity 0")
+		return
+	end
+	note("No Flatline: " .. table.concat(parts, ", "))
+	log(string.format("no flatline: %d field(s) at drop gravity %g (%s)",
+		total, WM.dropGravity, table.concat(parts, ", ")))
 end
 
 local function jobRestoreGravity()
-	local ok, n, err = applyWithRetry("Gravity", GRAVITY_RESTORE)
-	if not ok then
+	local total, parts, planned, err = applyGravityFamily(nil, "restore")
+	WM.state.flat = false
+	WM.state.worldflat = false
+	local back = WM.worldStock
+	if back ~= nil then
+		local ok = pcall(function() workspace.Gravity = back end)
+		WM.worldStock = nil
+		if ok then log(string.format("world gravity back to %g", back)) end
+	end
+	syncToggles()
+	if err then
 		fail("could not restore Gravity: " .. tostring(err))
 		return
 	end
-	WM.state.flat = false
-	syncToggles()
-	if n == 0 then
-		warn("Restore Gravity: no live Gravity field found - deploy into a match first")
+	if total == 0 then
+		warn("Restore Gravity: nothing was written back (" .. table.concat(parts, ", ") .. ")")
 		return
 	end
-	note(string.format("Gravity restored to %d (%d field(s))", GRAVITY_RESTORE, n))
+	note("Gravity restored: " .. table.concat(parts, ", "))
+	log("gravity restored: " .. table.concat(parts, ", "))
 end
 
 -- Puts every module that is switched on back the way the user left it. Only
@@ -555,8 +903,7 @@ local function jobRestoreMods()
 	local wanted = {}
 	if WM.state.spread then table.insert(wanted, { "Spread", SPREAD_TARGET, "spread" }) end
 	if WM.state.pen    then table.insert(wanted, { "Penetration", PEN_TARGET, "pen" }) end
-	if WM.state.flat   then table.insert(wanted, { "Gravity", GRAVITY_TARGET, "flat" }) end
-	if #wanted == 0 then
+	if #wanted == 0 and not WM.state.flat then
 		dbg("restore: no module is switched on")
 		return
 	end
@@ -569,6 +916,17 @@ local function jobRestoreMods()
 		else
 			WM.state[st] = false
 			table.insert(problems, key .. " (" .. tostring(err or "no live field") .. ")")
+		end
+	end
+	-- No Flatline goes through the gravity family, not through a single
+	-- "Gravity" field, so it is written the same way the module does it
+	if WM.state.flat then
+		local total, parts, planned, err = applyGravityFamily(WM.dropGravity, "flat")
+		if err or total == 0 then
+			WM.state.flat = false
+			table.insert(problems, "Gravity (" .. tostring(err or table.concat(parts, ", ")) .. ")")
+		else
+			table.insert(did, "Gravity=" .. total)
 		end
 	end
 	if #problems > 0 then
@@ -586,14 +944,18 @@ pump = function()
 	if not job then return end
 	local reason = guardReason()
 	if reason then
+		-- No timer here on purpose: task.delay does not run its callback in this
+		-- build. The job stays at the head of the queue and the 1 Hz watcher
+		-- retries it (see the watcher) until the guard clears by itself.
 		if not job.heldOnce then
 			job.heldOnce = true
-			warn("waiting to run '" .. job.name .. "' - " .. reason)
-		elseif WM.debug and (clock() - WM.holdLogged) > HOLD_LOG_INTERVAL then
 			WM.holdLogged = clock()
-			dbg(string.format("still holding '%s' back - %s", job.name, reason))
+			warn("waiting to run '" .. job.name .. "' - " .. reason)
+		elseif (clock() - WM.holdLogged) > HOLD_LOG_INTERVAL then
+			WM.holdLogged = clock()
+			log(string.format("still waiting to run '%s' - %s (it starts by itself as soon as that clears)",
+				job.name, reason))
 		end
-		task.delay(2, function() pump() end)
 		return
 	end
 	table.remove(WM.queue, 1)
@@ -614,7 +976,12 @@ pump = function()
 			fail(string.format("OP FAILED: %s -> %s", job.name, tostring(err)))
 		end
 		WM.lastOp = "(idle)"
-		task.delay(0.3, function() pump() end)
+		-- task.delay is a no-op in this build, so the continuation is a thread
+		-- that really does wait - without it the next queued job never started
+		task.spawn(function()
+			wait(0.3)
+			pump()
+		end)
 	end)
 end
 
@@ -662,9 +1029,9 @@ local function toggle(key, on)
 		if on then
 			-- uses the shared cache: instant when it is warm, otherwise the same one
 			-- scan as No Spread / Max Pen
-			enqueue("No Flatline ON (Gravity -> " .. GRAVITY_TARGET .. ")", jobFlatline)
+			enqueue("No Flatline ON (drop gravity -> " .. string.format("%g", WM.dropGravity) .. ")", jobFlatline)
 		else
-			note("No Flatline off - gravity stays " .. GRAVITY_TARGET .. " until you press Restore Gravity.")
+			note("No Flatline off - gravity stays " .. string.format("%g", WM.dropGravity) .. " until you press Restore Gravity.")
 		end
 		return
 	end
@@ -673,10 +1040,26 @@ end
 --============================= CONSOLE COMMANDS =============================
 local function cacheSummary()
 	if not WM.cache then return "none" end
-	return string.format("%d entries, %.0fs old, mode=%s, valid=%s, Spread=%d Pen=%d Grav=%d",
+	-- Spread=weapon/name: fields inside the matched weapon tables (what we meant
+	-- to write) against fields carrying that name anywhere in the cache (what
+	-- applygc can write). 0/0 = the game has no such field.
+	return string.format("%d entries, %.0fs old, mode=%s, valid=%s, Spread=%d/%d Pen=%d/%d Grav=%d",
 		#WM.cache, clock() - WM.lastScan, WM.filterMode, tostring(cacheValid()),
-		countEligible(WM.cache, "Spread"), countEligible(WM.cache, "Penetration"),
-		countEligible(WM.cache, "Gravity"))
+		countEligible(WM.cache, "Spread"), countNumeric(WM.cache, "Spread"),
+		countEligible(WM.cache, "Penetration"), countNumeric(WM.cache, "Penetration"),
+		countNumeric(WM.cache, "Gravity"))
+end
+
+-- what the gravity probe found, with the stock value we remembered for each
+local function gravitySummary()
+	local names = {}
+	for _, k in ipairs(WM.gravKeys or {}) do
+		local o = WM.orig[k]
+		names[#names + 1] = ((o ~= nil) and string.format("%s(stock %g)", k, o) or k)
+			.. (WM.gravPatched[k] and " [we wrote it]" or "")
+	end
+	if #names == 0 then return "no Gravity-style field found" end
+	return table.concat(names, ", ")
 end
 
 local function cmdStatus()
@@ -696,6 +1079,11 @@ local function cmdStatus()
 		tostring(menuGuiName()), settleLeft(), WM.placeId))
 	print(string.format("  guard: %s", tostring(guardReason()) or "SAFE - GC may be touched"))
 	print(string.format("  cache: %s", cacheSummary()))
+	print(string.format("  drop gravity: %g (fixed - No Flatline writes this to every gravity field)",
+		WM.dropGravity))
+	print(string.format("  gravity keys: %s", gravitySummary()))
+	print(string.format("  world gravity: %s (we set it to 0: %s)",
+		tostring(worldGravityNow()), tostring(WM.state.worldflat)))
 	-- read-only cache check: press Status after a death to see whether the cached
 	-- addresses are still live. No scan and no write happens in here.
 	if WM.cache and not WM.busy then pcall(verifyCache) end
@@ -726,7 +1114,7 @@ end
 
 local function cmdRestoreGravity()
 	WM.state.flat = false
-	enqueue("Restore Gravity (" .. GRAVITY_RESTORE .. ")", jobRestoreGravity)
+	enqueue("Restore Gravity (stock values)", jobRestoreGravity)
 end
 
 local function cmdReapply()
@@ -735,6 +1123,67 @@ end
 
 local function cmdScan()
 	enqueue("Scan GC", jobScan)
+end
+
+-- Reads the game's own ballistics code and prints only the interesting lines.
+-- This is how the real field names and the real math get found instead of
+-- guessed: if the client never computes spread / penetration / drop, no write
+-- into a client table can ever change them, and one look at the source says so.
+-- Read only - no value is written by this.
+local DUMP_KEYWORDS = { "Spread", "Penetration", "Gravity", "Recoil", "Drop",
+                        "Ballistic", "MuzzleVelocity", "ShotAmount", "Flatline" }
+local DUMP_PATTERNS = { "ballistic", "weapon", "gun", "spread", "penetrat" }
+local DUMP_MAX_LINES = 250
+
+local function cmdDump()
+	local ok, list = pcall(getscripts)
+	if not ok or type(list) ~= "table" then
+		fail("could not list the game's scripts (getscripts failed)")
+		return
+	end
+	log(string.format("%d script(s) loaded - decompiling the ballistics / weapon ones", #list))
+	local tried, hits = 0, 0
+	for _, s in ipairs(list) do
+		local name, path
+		pcall(function() name = s.Name; path = s:GetFullName() end)
+		if type(path) == "string" and type(name) == "string" then
+			local low = string.lower(path)
+			local wanted = false
+			for _, pat in ipairs(DUMP_PATTERNS) do
+				if string.find(low, pat, 1, true) then wanted = true; break end
+			end
+			if wanted then
+				tried = tried + 1
+				local dok, src = pcall(decompile, s)
+				if dok and type(src) == "string" and #src > 0 then
+					log(string.format("--- %s (%d chars) ---", path, #src))
+					local n = 0
+					for line in string.gmatch(src, "[^\n]*") do
+						n = n + 1
+						local match = false
+						for _, kw in ipairs(DUMP_KEYWORDS) do
+							if string.find(line, kw, 1, true) then match = true; break end
+						end
+						if match then
+							hits = hits + 1
+							if hits > DUMP_MAX_LINES then
+								log("... cut off after " .. DUMP_MAX_LINES .. " matching lines")
+								break
+							end
+							print(string.format("  %s:%d  %s", name, n, line))
+						end
+					end
+				else
+					log("could not decompile " .. path)
+				end
+			end
+		end
+	end
+	if tried == 0 then
+		log("no script named like ballistics / weapon / gun was found - nothing to dump")
+	else
+		log(string.format("dumped %d matching line(s) from %d script(s) - scroll up, F9", hits, tried))
+	end
 end
 
 WM.stop = cmdStop
@@ -772,40 +1221,44 @@ if not (UI and UI.Alive) then
 end
 
 local tab = UI:AddTab({ Title = "Weapon Mods", Icon = "script" })
-local ToggleObjs = {}
+-- the toggles, so they can be set back from code (Restore Gravity, World flat)
+local Ctls = {}
 
 -- REM shows 4 controls per page in the order you add them, so page 1 is the
--- four gun modules and everything else lives on the later pages.
--- Page 1: the four main gun modules.
-ToggleObjs.recoil = tab:AddToggle({
+-- four gun modules and everything else lives on the later pages:
+--   page 1: the four gun modules
+--   page 2: Status / Restore Gravity / World gravity 0 / Re-apply now
+--   page 3: Scan GC / Debug Keys / Dump ballistics code / Run now
+--   page 4: banner / Stop
+Ctls.recoil = tab:AddToggle({
 	Title = "No Recoil",
 	Description = "Debug shot overlay - removes visible recoil.",
 	Default = WM.state.recoil,
 	Callback = function(v) toggle("recoil", v) end,
 })
 
-ToggleObjs.spread = tab:AddToggle({
+Ctls.spread = tab:AddToggle({
 	Title = "No Spread",
-	Description = "Spread = 0. Needs the shared cache: scans the GC the first time (20-45s).",
+	Description = "Zeroes every Spread field the scan found. Off does not put the stock value back - the patch stays until you rejoin. Scans the GC the first time (20-45s), then it is instant.",
 	Default = WM.state.spread,
 	Callback = function(v) toggle("spread", v) end,
 })
 
-ToggleObjs.pen = tab:AddToggle({
+Ctls.pen = tab:AddToggle({
 	Title = "Max Penetration",
-	Description = "Penetration = 10 (the game's own cap). Reuses the same cache.",
+	Description = "Penetration = 10 (the game's own cap). Off does not put the stock value back - the patch stays until you rejoin. Reuses the same cache.",
 	Default = WM.state.pen,
 	Callback = function(v) toggle("pen", v) end,
 })
 
-ToggleObjs.flat = tab:AddToggle({
+Ctls.flat = tab:AddToggle({
 	Title = "No Flatline",
-	Description = "Gravity = 0, exact zero bullet drop. Instant once the cache is warm.",
+	Description = "Writes the drop gravity (0.1) to every gravity-style field the game has (Gravity, BulletGravity, GravityScale...). Instant once the cache is warm.",
 	Default = WM.state.flat,
 	Callback = function(v) toggle("flat", v) end,
 })
 
--- Page 2: gun tools (Status / Restore / Re-apply / Scan).
+-- Page 2 starts here: the gun tools, plus the last-resort world gravity toggle.
 tab:AddButton({
 	Title = "Status",
 	Description = "Prints the full state to the console (F9).",
@@ -815,9 +1268,17 @@ tab:AddButton({
 
 tab:AddButton({
 	Title = "Restore Gravity",
-	Description = "Puts Gravity back to 75 using the cache (scans once if there is none).",
+	Description = "Puts the stock gravity back (remembered per field from the scan) and turns World gravity off.",
 	ButtonText = "Restore",
 	Callback = function() cmdRestoreGravity() end,
+})
+
+-- Last resort, off by default: the only thing here that writes workspace.Gravity.
+Ctls.worldflat = tab:AddToggle({
+	Title = "World gravity 0 (last resort)",
+	Description = "Only if the gravity probe line says there is no Gravity-style field, or bullets still fall. Client side only - your character may float, flip it off at once if it does.",
+	Default = WM.state.worldflat,
+	Callback = function(v) cmdWorldFlat(v) end,
 })
 
 tab:AddButton({
@@ -827,6 +1288,7 @@ tab:AddButton({
 	Callback = function() cmdReapply() end,
 })
 
+-- Page 3 starts here: Scan GC / Debug Keys / Dump ballistics code / Run now.
 tab:AddButton({
 	Title = "Scan GC",
 	Description = "Normally only needed once, the first time. 20-45s - do not toggle during it.",
@@ -834,12 +1296,18 @@ tab:AddButton({
 	Callback = function() cmdScan() end,
 })
 
--- Last page: debug / advanced (Debug Keys, Run now, info, Stop).
 tab:AddToggle({
 	Title = "Debug Keys",
 	Description = "Show internal chatter in the console.",
 	Default = WM.debug,
 	Callback = function(v) WM.debug = v and true or false end,
+})
+
+tab:AddButton({
+	Title = "Dump ballistics code",
+	Description = "Reads the game's ballistics / weapon scripts and prints the lines about Spread, Penetration, Gravity and drop. Use this if a stat will not move: it shows the real field names. Read only.",
+	ButtonText = "Dump",
+	Callback = function() cmdDump() end,
 })
 
 tab:AddButton({
@@ -864,9 +1332,12 @@ tab:AddButton({
 
 syncToggles = function()
 	pcall(function()
-		if ToggleObjs.flat then ToggleObjs.flat:SetValue(WM.state.flat and true or false, true) end
-		if ToggleObjs.spread then ToggleObjs.spread:SetValue(WM.state.spread and true or false, true) end
-		if ToggleObjs.pen then ToggleObjs.pen:SetValue(WM.state.pen and true or false, true) end
+		if Ctls.flat then Ctls.flat:SetValue(WM.state.flat and true or false, true) end
+		if Ctls.spread then Ctls.spread:SetValue(WM.state.spread and true or false, true) end
+		if Ctls.pen then Ctls.pen:SetValue(WM.state.pen and true or false, true) end
+		if Ctls.worldflat then
+			Ctls.worldflat:SetValue(WM.state.worldflat and true or false, true)
+		end
 	end)
 end
 
@@ -877,17 +1348,21 @@ _G.WM_Status         = cmdStatus
 _G.WM_Tool           = cmdTool
 _G.WM_Reapply        = cmdReapply
 _G.WM_RestoreGravity = cmdRestoreGravity
+_G.WM_WorldFlat      = cmdWorldFlat
 _G.WM_Scan           = cmdScan
 _G.WM_Force          = cmdForce
 _G.WM_Stop           = cmdStop
+_G.WM_Dump           = cmdDump
 _G.WM                = WM
 WM_Status         = cmdStatus
 WM_Tool           = cmdTool
 WM_Reapply        = cmdReapply
 WM_RestoreGravity = cmdRestoreGravity
+WM_WorldFlat      = cmdWorldFlat
 WM_Scan           = cmdScan
 WM_Force          = cmdForce
 WM_Stop           = cmdStop
+WM_Dump           = cmdDump
 
 --============================= WATCHER ======================================
 task.spawn(function()
@@ -924,6 +1399,13 @@ task.spawn(function()
 				WM.lastChange = clock()
 				dbg("character changed - nothing to do, the mods stay as they are")
 			end
+			-- Keep the queue moving (after the bookkeeping above, so a fresh spawn is
+			-- already accounted for by the guard). Nothing is scanned or re-applied by
+			-- itself and no cache is dropped here, but a job you asked for that is
+			-- being held back is retried once a second until it can run. This is the
+			-- safety net task.delay was supposed to be - it does not run its callback
+			-- in this build, which is what let the whole queue stall before.
+			if (not WM.busy) and #WM.queue > 0 then pcall(pump) end
 			-- No Recoil: checked every second, written only if the game cleared it
 			if WM.state.recoil then
 				local _, msg, wrote = setRecoil(true)
@@ -950,4 +1432,4 @@ end)
 
 dbg("ready - writes only go through a live cache, heartbeat every 60s")
 log("ready - right shift opens the menu. Death / class swap changes nothing; press Stop before you rejoin.")
-notify("Weapon Mods", "Loaded. Death and class swaps change nothing now.", "success", 6)
+notify("Weapon Mods", "Loaded. No Flatline writes a fixed drop gravity - just flip it on.", "success", 6)
